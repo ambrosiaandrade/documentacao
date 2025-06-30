@@ -13,6 +13,41 @@
 - [Tratamento de exceção](#tratamento-de-exceção)
 - [Configuração](#configuração)
 
+## Breve explicação
+O Apache Kafka é uma plataforma de mensageria distribuída que permite a comunicação assíncrona entre sistemas por meio do envio e recebimento de mensagens. Ele atua como um intermediário entre quem produz (envia) e quem consome (processa) mensagens.
+
+Uma analogia útil é a dos correios:
+
+* Uma pessoa escreve uma carta (produtor), envia pelos correios (Kafka Broker), e outra pessoa a recebe (consumidor).
+
+* Os correios organizam essas cartas por assunto, como países (tópicos), e dentro de cada país, por cidade (partições).
+
+
+**Fluxo básico**
+produtor -> broker (servidor Kafka) -> consumidor
+
+**Principais conceitos**
+
+| Termo         | Explicação                                                                 |
+| ------------- | -------------------------------------------------------------------------- |
+| **Broker**    | Servidor Kafka que armazena os dados e gerencia os tópicos e partições.    |
+| **Cluster**   | Conjunto de brokers Kafka trabalhando juntos para garantir escalabilidade. |
+| **Topic**     | Categoria ou nome lógico para agrupar mensagens (ex: `paises`).            |
+| **Partition** | Subdivisão de um tópico para paralelizar o processamento.                  |
+| **Offset**    | Posição única da mensagem dentro de uma partição, como um índice.          |
+| **Producer**  | Componente que envia (publica) mensagens para um tópico.                   |
+| **Consumer**  | Componente que lê (consome) mensagens de um tópico.                        |
+
+**Exemplo ilustrativo**
+Imagine o tópico paises, com as seguintes partições:
+* paises-0 → mensagens sobre "Brasil"
+* paises-1 → mensagens sobre "Chile"
+* paises-2 → mensagens sobre "Argentina"
+
+Cada mensagem tem um offset, como se fosse a posição na fila daquela partição. O consumidor usa o offset para saber até onde já leu.
+
+![kafka](./img/kafka.png)
+
 ## Dependência e configuração
 Arquivo ``pom.xml``
 ```java
@@ -208,6 +243,7 @@ public void consumeWithRetry(String message) {
 ```
 
 Busca mensagens do tópico
+OBS: apenas para fins administrativos ou testes, em produção é ``@KafkaListener``
 ```java
 
 @Autowired
@@ -246,8 +282,6 @@ public List<String> fetchMessagesFromKafka(int maxMessages) {
 ```java
 public class KafkaErrorHandler {
 
-    private static final Logger log = LoggerFactory.getLogger(KafkaErrorHandler.class);
-
     @Bean
     public ConsumerAwareListenerErrorHandler kafkaErrorHandler() {
         return (message, exception, consumer) -> {
@@ -256,29 +290,24 @@ public class KafkaErrorHandler {
         };
     }
 }
-
-}
 ```
-* **Um pouco mais avançado com o envio para uma fila `DLQ`**
+* **Um pouco mais avançado com o envio para uma fila DLQ (Dead Letter Queue)**
 ```java
 public class KafkaErrorHandler {
-
-    private static final Logger log = LoggerFactory.getLogger(KafkaErrorHandler.class);
 
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
-    // DLQ (Dead Letter Queue)
     @Bean
     public ConsumerAwareListenerErrorHandler kafkaErrorHandlerWithDLQ() {
-    return (message, exception, consumer) -> {
-        String payload = (String) message.getPayload();
-        log.error("[Kafka Error] Failed to process message: {}", payload, exception);
+        return (message, exception, consumer) -> {
+            String payload = (String) message.getPayload();
+            log.error("[Kafka Error] Failed to process message: {}", payload, exception);
 
-        kafkaTemplate.send("my-dlq-topic", payload);
-        return null;
-    };
-}
+            kafkaTemplate.send("my-dlq-topic", payload);
+            return null;
+        };
+    }
 
 }
 ```
@@ -319,6 +348,23 @@ public class KafkaDLQConfig {
 ```java
 @Configuration
 public class KafkaListenerConfig {
+
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Value("${spring.kafka.consumer.group-id}")
+    private String groupId;
+
+    @Bean
+    public ConsumerFactory<String, String> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
 
     @Bean
     public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
@@ -363,46 +409,9 @@ public void listenDLQ(String message) {
 | 🔍 Ajuda na auditoria/debug              | O consumidor DLQ pode logar ou notificar |
 | 🧩 Totalmente integrado com Spring Kafka | Sem código extra no seu serviço          |
 
-
-## Configuração
-```java
-@Configuration
-public class KafkaConsumerConfig {
-    
-    @Value("${spring.kafka.bootstrap-servers}")
-    private String bootstrapServers;
-
-    @Value("${spring.kafka.consumer.group-id}")
-    private String groupId;
-
-    @Bean
-    public ConsumerFactory<String, String> consumerFactory() {
-        Map<String, Object> props = new HashMap<>();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        return new DefaultKafkaConsumerFactory<>(props);
-    }
-
-    @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory() {
-        ConcurrentKafkaListenerContainerFactory<String, String> factory = new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory());
-        return factory;
-    }
-
-}
-```
-
-
 ------
-**reorganização clara e enxuta**:
 
----
-
-## ✅ Objetivo:
+## ✅ Reorganização:
 
 1. **Separar as responsabilidades em três partes claras**:
 
@@ -520,6 +529,17 @@ public class KafkaConsumerConfig {
     }
 
     @Bean
+    public ConsumerFactory<String, String> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+
+    @Bean
     public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
             ConsumerFactory<String, String> consumerFactory,
             DefaultErrorHandler errorHandler) {
@@ -617,7 +637,7 @@ src/main/java/
 │   └── KafkaProperties.java
 ├── service/
 │   └── KafkaProducerService.java
-└── consumer/
+└── listener/
     ├── MyKafkaListener.java
     └── DlqKafkaListener.java
 ```
