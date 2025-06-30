@@ -428,6 +428,7 @@ public void listenDLQ(String message) {
 ## 📁 Organização final sugerida
 
 ### 1. ✅ `KafkaProperties.java`
+Mais informações em [configuration-properties](./configuration-properties.md)
 
 ```java
 @Component
