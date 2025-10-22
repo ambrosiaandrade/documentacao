@@ -21,7 +21,7 @@ def gerar_toc(markdown_text):
 
 # 👇 Exemplo de uso
 if __name__ == "__main__":
-    with open("spring-actuator.md", "r", encoding="utf-8") as f:
+    with open("C:\workspace\_java-lab\docs\\func_prog\README.en-US.md", "r", encoding="utf-8") as f:
         markdown_content = f.read()
     toc = gerar_toc(markdown_content)
     print("## 📚 Tabela de conteúdos\n")

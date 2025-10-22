@@ -243,42 +243,44 @@ public void consumeWithRetry(String message) {
 ```
 
 Busca mensagens do tópico
-OBS: apenas para fins administrativos ou testes, em produção é ``@KafkaListener``
+_OBS: apenas para fins administrativos ou testes, em produção é ``@KafkaListener``_
 ```java
 
 @Autowired
 private ConsumerFactory<String, String> consumerFactory;
 
 public List<String> fetchMessagesFromKafka(int maxMessages) {
-    List<String> fetchedMessages = new java.util.ArrayList<>();
-    KafkaConsumer<String, String> consumer = null;
-    try {
-        consumer = (KafkaConsumer<String, String>) consumerFactory.createConsumer();
-        consumer.subscribe(java.util.Collections.singletonList(TOPIC));
-        consumer.poll(java.time.Duration.ZERO); // força atribuição de partições
+    List<String> messages = new ArrayList<>();
+
+    try (KafkaConsumer<String, String> consumer = (KafkaConsumer<String, String>) consumerFactory.createConsumer()) {
+        consumer.subscribe(List.of(topic));
+        consumer.poll(Duration.ZERO); // força a atribuição de partições
 
         int count = 0;
+
         while (count < maxMessages) {
-            ConsumerRecords<String, String> records = consumer.poll(java.time.Duration.ofSeconds(2));
-            for (ConsumerRecord<String, String> record : records) {
-                fetchedMessages.add(record.value());
-                count++;
-                if (count >= maxMessages) break;
+            var records = consumer.poll(Duration.ofSeconds(2));
+
+            for (var record : records) {
+                messages.add(record.value());
+                if (++count >= maxMessages) break;
             }
-            consumer.commitSync(); // commit offsets after processing
-            if (records.isEmpty()) break;
+
+            consumer.commitSync();
+
+            if (records.isEmpty()) break; // se não veio nada, encerra
         }
+
     } catch (Exception e) {
-        log.error("[Kafka] Error fetching messages from Kafka", e);
-    } finally {
-        if (consumer != null) consumer.close();
+        log.error("[Kafka] Erro ao buscar mensagens", e);
     }
-    return fetchedMessages;
+
+    return messages;
 }
 ```
 
 ## Tratamento de exceção
-* **O mais simples**
+**O mais simples**
 ```java
 public class KafkaErrorHandler {
 
@@ -291,7 +293,7 @@ public class KafkaErrorHandler {
     }
 }
 ```
-* **Um pouco mais avançado com o envio para uma fila DLQ (Dead Letter Queue)**
+**Um pouco mais avançado com o envio para uma fila DLQ (Dead Letter Queue)**
 ```java
 public class KafkaErrorHandler {
 
@@ -312,7 +314,7 @@ public class KafkaErrorHandler {
 }
 ```
 
-* **Mais avançado e recomendado**
+**Mais avançado e recomendado**
 * O Spring Kafka tenta reprocessar (retries internos do listener).
 * Se todas as tentativas falharem, ele envia a mensagem automaticamente para um tópico DLQ.
 ```java
