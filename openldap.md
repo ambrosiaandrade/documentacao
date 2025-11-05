@@ -136,3 +136,52 @@ Adicionar atributos: RG, pisPasep, dataNascimento, cnpjEmpresa (novos OIDs em 1.
 Fluxo: limpar → subir → esperar → schema EXTERNAL → OU → usuários → validar. Resultado: usuários pesquisáveis por `cpf` e `username`.
 
 Fim.
+
+
+---
+
+```ldif
+dn: cn=brasileiro,cn=schema,cn=config
+objectClass: olcSchemaConfig
+cn: brasileiro
+
+# Atributos Brasileiros
+olcAttributeTypes: ( 1.3.6.1.4.1.99999.1.1.1
+  NAME 'cpf'
+  DESC 'CPF do usuário brasileiro'
+  EQUALITY caseIgnoreMatch
+  SUBSTR caseIgnoreSubstringsMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{11}
+  SINGLE-VALUE )
+
+olcAttributeTypes: ( 1.3.6.1.4.1.99999.1.1.2
+  NAME 'rg'
+  DESC 'RG do usuário brasileiro'
+  EQUALITY caseIgnoreMatch
+  SUBSTR caseIgnoreSubstringsMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{20}
+  SINGLE-VALUE )
+
+olcAttributeTypes: ( 1.3.6.1.4.1.99999.1.1.3
+  NAME 'pis'
+  DESC 'PIS/PASEP do usuário brasileiro'
+  EQUALITY caseIgnoreMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{11}
+  SINGLE-VALUE )
+
+olcAttributeTypes: ( 1.3.6.1.4.1.99999.1.1.4
+  NAME 'username'
+  DESC 'Username customizado do usuário'
+  EQUALITY caseIgnoreMatch
+  SUBSTR caseIgnoreSubstringsMatch
+  SYNTAX 1.3.6.1.4.1.1466.115.121.1.15
+  SINGLE-VALUE )
+
+# ObjectClass que usa todos os atributos
+olcObjectClasses: ( 1.3.6.1.4.1.99999.2.1.1
+  NAME 'brUser'
+  DESC 'Usuário brasileiro completo'
+  SUP inetOrgPerson
+  STRUCTURAL
+  MAY ( cpf $ rg $ pis $ username ) )
+```
