@@ -1,0 +1,492 @@
+@startuml CQRS Pattern - Command Query Responsibility Segregation
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title CQRS - Command Query Responsibility Segregation
+
+actor Cliente as client
+participant "API Gateway" as gateway
+
+box "Command Side (Write Model)" #LightCoral
+  participant "Command\nHandler" as cmd_handler
+  participant "Order\nAggregate" as aggregate
+  database "Write DB\n(PostgreSQL)" as write_db
+  queue "Event Bus\n(Kafka)" as event_bus
+end box
+
+box "Query Side (Read Model)" #LightGreen
+  participant "Event\nConsumer" as event_consumer
+  database "Read DB\n(MongoDB)" as read_db
+  participant "Query\nHandler" as query_handler
+end box
+
+participant "Projector" as projector
+
+== Command: Create Order (Write) ==
+
+client -> gateway: POST /commands/create-order\n{"customerId": "123", "items": [...]}
+activate gateway
+
+gateway -> gateway: validate JWT
+gateway -> gateway: route to command handler
+
+gateway -> cmd_handler: CreateOrderCommand(\n  commandId,\n  customerId,\n  items)
+activate cmd_handler
+
+note right of cmd_handler
+  **Command Handler:**
+  - Processa intenções de mudança
+  - Valida regras de negócio
+  - Persiste no Write Model
+  - Publica eventos
+  
+  ```java
+  @CommandHandler
+  public class CreateOrderHandler {
+    void handle(CreateOrderCommand cmd) {
+      // Load aggregate
+      // Execute business logic
+      // Save aggregate
+      // Publish events
+    }
+  }
+  ```
+end note
+
+cmd_handler -> aggregate: create(\n  orderId,\n  customerId,\n  items)
+activate aggregate
+
+aggregate -> aggregate: validateCustomer()
+aggregate -> aggregate: validateItems()
+aggregate -> aggregate: calculateTotal()
+aggregate -> aggregate: applyBusinessRules()
+
+aggregate -> aggregate: recordEvent(\n  OrderCreatedEvent)
+
+note right of aggregate
+  **Event-Driven Aggregate:**
+  - Gera eventos de domínio
+  - Estado derivado de eventos
+  - Imutável após criação
+  
+  ```java
+  public class OrderAggregate {
+    private List<DomainEvent> changes;
+    
+    public void createOrder(...) {
+      validateBusinessRules();
+      
+      OrderCreatedEvent event = 
+        new OrderCreatedEvent(...);
+      
+      apply(event);
+      changes.add(event);
+    }
+    
+    private void apply(
+      OrderCreatedEvent e
+    ) {
+      this.orderId = e.orderId;
+      this.status = PENDING;
+      // ...
+    }
+  }
+  ```
+end note
+
+aggregate --> cmd_handler: OrderAggregate\n(with uncommitted events)
+deactivate aggregate
+
+cmd_handler -> write_db: BEGIN TRANSACTION
+activate write_db
+
+cmd_handler -> write_db: INSERT INTO orders\n(id, customer_id, total, status)\nVALUES (...)
+write_db --> cmd_handler: inserted
+
+cmd_handler -> write_db: INSERT INTO order_items\n(order_id, product_id, qty)\nVALUES (...)
+write_db --> cmd_handler: inserted
+
+cmd_handler -> write_db: COMMIT
+write_db --> cmd_handler: committed
+deactivate write_db
+
+note right of write_db
+  **Write Database (Normalized):**
+  - PostgreSQL (ACID)
+  - Schema normalizado (3NF)
+  - Otimizado para writes
+  - Transações garantidas
+  - Constraints de integridade
+  
+  Tables:
+  - orders (id, customer_id, total, status)
+  - order_items (id, order_id, product_id, qty)
+  - order_audit (id, order_id, event, timestamp)
+end note
+
+cmd_handler -> event_bus: publish(\n  OrderCreatedEvent)
+activate event_bus
+event_bus --> cmd_handler: ack
+deactivate event_bus
+
+cmd_handler --> gateway: CommandResult(\n  orderId: "ORD-123",\n  success: true)
+deactivate cmd_handler
+
+gateway --> client: 202 Accepted\n{"orderId": "ORD-123",\n "status": "processing"}
+deactivate gateway
+
+note right of client
+  **Command Response:**
+  - 202 Accepted (async)
+  - Não retorna dados completos
+  - Apenas confirmação
+  - Cliente deve consultar depois
+end note
+
+== Event Processing: Update Read Model ==
+
+event_bus -> event_consumer: OrderCreatedEvent(\n  orderId: "ORD-123",\n  customerId: "123",\n  items: [...],\n  total: 150.00)
+activate event_consumer
+
+note right of event_consumer
+  **Event Consumer:**
+  - Escuta eventos do Command Side
+  - Atualiza Read Models
+  - Pode criar múltiplas projeções
+  - Processamento assíncrono
+  
+  ```java
+  @KafkaListener(
+    topics = "order-events"
+  )
+  public class OrderEventConsumer {
+    void handle(OrderCreatedEvent e) {
+      // Update read model
+      // Update multiple projections
+      // Send notifications
+    }
+  }
+  ```
+end note
+
+event_consumer -> projector: project(event)
+activate projector
+
+projector -> projector: buildReadModel(event)
+
+note right of projector
+  **Projector:**
+  - Transforma eventos em views
+  - Denormaliza dados
+  - Otimiza para queries
+  - Pode criar cache
+end note
+
+projector -> read_db: updateOne(\n  {orderId: "ORD-123"},\n  {$set: {...}},\n  {upsert: true})
+activate read_db
+
+read_db -> read_db: store denormalized document
+
+note right of read_db
+  **Read Database (Denormalized):**
+  - MongoDB (Document)
+  - Schema denormalizado
+  - Otimizado para reads
+  - Dados duplicados OK
+  - Joins evitados
+  
+  Document:
+  ```json
+  {
+    "orderId": "ORD-123",
+    "customerId": "123",
+    "customerName": "John Doe",
+    "customerEmail": "john@example.com",
+    "items": [
+      {
+        "productId": "PROD-1",
+        "productName": "Laptop",
+        "price": 1200.00,
+        "qty": 1
+      }
+    ],
+    "total": 1200.00,
+    "status": "PENDING",
+    "createdAt": "2025-11-15T10:00:00Z"
+  }
+  ```
+  
+  **Benefícios:**
+  - Query rápida (single document)
+  - Sem joins
+  - Dados pré-computados
+end note
+
+read_db --> projector: updated
+deactivate read_db
+
+projector --> event_consumer: projection updated
+deactivate projector
+
+event_consumer --> event_bus: ack
+deactivate event_consumer
+
+== Query: Get Order Details (Read) ==
+
+client -> gateway: GET /queries/orders/ORD-123
+activate gateway
+
+gateway -> gateway: route to query handler
+
+gateway -> query_handler: GetOrderQuery(\n  orderId: "ORD-123")
+activate query_handler
+
+note right of query_handler
+  **Query Handler:**
+  - Apenas leitura (read-only)
+  - Sem business logic
+  - Sem side-effects
+  - Otimizado para performance
+  
+  ```java
+  @QueryHandler
+  public class GetOrderHandler {
+    OrderDTO handle(GetOrderQuery q) {
+      return readRepository
+        .findById(q.orderId);
+    }
+  }
+  ```
+end note
+
+query_handler -> read_db: db.orders.findOne(\n  {orderId: "ORD-123"})
+activate read_db
+
+read_db -> read_db: fetch document (indexed)
+
+note right of read_db
+  **Query Performance:**
+  - Index em orderId
+  - Single document read
+  - Sem joins
+  - Latência: ~1-5ms
+  - Cache possível (Redis)
+end note
+
+read_db --> query_handler: OrderDocument
+deactivate read_db
+
+query_handler -> query_handler: mapToDTO(document)
+
+query_handler --> gateway: OrderDTO(\n  orderId,\n  customer: {...},\n  items: [...],\n  total,\n  status)
+deactivate query_handler
+
+gateway --> client: 200 OK\n{"orderId": "ORD-123",\n "customer": {...},\n "items": [...],\n "total": 1200.00,\n "status": "PENDING"}
+deactivate gateway
+
+note right of client
+  **Query Response:**
+  - 200 OK (sync)
+  - Dados completos
+  - Denormalizados
+  - Query rápida (<10ms)
+end note
+
+== Command: Update Order Status ==
+
+client -> gateway: POST /commands/confirm-order\n{"orderId": "ORD-123"}
+activate gateway
+
+gateway -> cmd_handler: ConfirmOrderCommand(\n  orderId: "ORD-123")
+activate cmd_handler
+
+cmd_handler -> write_db: SELECT * FROM orders\nWHERE id = 'ORD-123'\nFOR UPDATE
+activate write_db
+write_db --> cmd_handler: order row (locked)
+deactivate write_db
+
+cmd_handler -> aggregate: load(orderId)
+activate aggregate
+aggregate --> cmd_handler: OrderAggregate
+deactivate aggregate
+
+cmd_handler -> aggregate: confirm()
+activate aggregate
+aggregate -> aggregate: validateCanConfirm()
+aggregate -> aggregate: recordEvent(\n  OrderConfirmedEvent)
+aggregate --> cmd_handler: OrderAggregate\n(with new events)
+deactivate aggregate
+
+cmd_handler -> write_db: UPDATE orders\nSET status = 'CONFIRMED'\nWHERE id = 'ORD-123'
+activate write_db
+write_db --> cmd_handler: updated
+deactivate write_db
+
+cmd_handler -> event_bus: publish(\n  OrderConfirmedEvent)
+activate event_bus
+event_bus --> cmd_handler: ack
+deactivate event_bus
+
+cmd_handler --> gateway: CommandResult(success: true)
+deactivate cmd_handler
+
+gateway --> client: 202 Accepted
+deactivate gateway
+
+== Event Processing: Update Read Model (Status) ==
+
+event_bus -> event_consumer: OrderConfirmedEvent(\n  orderId: "ORD-123",\n  confirmedAt: "...")
+activate event_consumer
+
+event_consumer -> projector: project(event)
+activate projector
+
+projector -> read_db: updateOne(\n  {orderId: "ORD-123"},\n  {$set: {\n    status: "CONFIRMED",\n    confirmedAt: "..."\n  }})
+activate read_db
+read_db --> projector: updated
+deactivate read_db
+
+projector --> event_consumer: projection updated
+deactivate projector
+
+event_consumer --> event_bus: ack
+deactivate event_consumer
+
+note right of read_db
+  **Eventual Consistency:**
+  - Command executado: t=0
+  - Evento publicado: t=5ms
+  - Read model atualizado: t=50ms
+  - Cliente query: pode ver estado antigo
+  - Acceptable delay: <100ms
+end note
+
+== Query: List Orders by Customer (Complex Query) ==
+
+client -> gateway: GET /queries/customers/123/orders\n?status=PENDING&sort=createdAt:desc
+activate gateway
+
+gateway -> query_handler: ListCustomerOrdersQuery(\n  customerId: "123",\n  status: PENDING,\n  sort: createdAt desc)
+activate query_handler
+
+query_handler -> read_db: db.orders.find(\n  {customerId: "123",\n   status: "PENDING"})\n.sort({createdAt: -1})\n.limit(20)
+activate read_db
+
+read_db -> read_db: use index: customerId + status
+
+note right of read_db
+  **Compound Index:**
+  - {customerId: 1, status: 1, createdAt: -1}
+  - Query performance: O(log n)
+  - Retorna sorted results
+  - Sem scan completo
+end note
+
+read_db --> query_handler: List<OrderDocument>
+deactivate read_db
+
+query_handler -> query_handler: mapToDTOs(documents)
+
+query_handler --> gateway: List<OrderDTO>
+deactivate query_handler
+
+gateway --> client: 200 OK\n[{...}, {...}, ...]
+deactivate gateway
+
+== Multiple Read Models (Different Projections) ==
+
+event_bus -> event_consumer: OrderConfirmedEvent
+activate event_consumer
+
+event_consumer -> projector: project to Orders View
+activate projector
+projector -> read_db: update orders collection
+read_db --> projector: updated
+projector --> event_consumer: done
+deactivate projector
+
+event_consumer -> projector: project to Customer Summary
+activate projector
+projector -> read_db: update customer_stats collection\n(increment order_count,\n update total_spent)
+read_db --> projector: updated
+projector --> event_consumer: done
+deactivate projector
+
+event_consumer -> projector: project to Analytics
+activate projector
+projector -> read_db: update order_analytics collection\n(daily_revenue,\n products_sold)
+read_db --> projector: updated
+projector --> event_consumer: done
+deactivate projector
+
+event_consumer --> event_bus: ack
+deactivate event_consumer
+
+note right of projector
+  **Multiple Projections from Same Event:**
+  
+  1. **Orders View:** Full order details
+  2. **Customer Summary:** Aggregated stats
+  3. **Analytics:** Business metrics
+  4. **Search Index:** Elasticsearch
+  5. **Cache:** Redis
+  
+  Cada projeção otimizada para seu caso de uso!
+end note
+
+== CQRS Benefits & Trade-offs ==
+
+note over write_db, read_db
+  **Benefits:**
+  
+  ✅ **Scalability:**
+  - Read/Write databases independentes
+  - Scale reads separadamente (replicas)
+  - Scale writes separadamente (sharding)
+  
+  ✅ **Performance:**
+  - Writes otimizados (normalized)
+  - Reads otimizados (denormalized)
+  - Sem conflito de índices
+  
+  ✅ **Flexibility:**
+  - Múltiplas read models
+  - Diferentes databases (poly-persistence)
+  - Cache layers transparentes
+  
+  ✅ **Security:**
+  - Segregação de acesso
+  - Commands autenticados
+  - Queries podem ser públicas
+  
+  **Trade-offs:**
+  
+  ⚠️ **Eventual Consistency:**
+  - Read model pode estar desatualizado
+  - Requires user education
+  - Necessita versioning
+  
+  ⚠️ **Complexity:**
+  - Dois models para manter
+  - Event handling infrastructure
+  - Debugging mais difícil
+  
+  ⚠️ **Data Duplication:**
+  - Dados em múltiplos stores
+  - Aumenta storage costs
+  - Sync entre models necessária
+  
+  **When to Use:**
+  - High read/write ratio
+  - Complex queries needed
+  - Different scaling requirements
+  - Multiple client types
+  
+  **When NOT to Use:**
+  - Simple CRUD apps
+  - Strong consistency required
+  - Small team/simple domain
+end note
+
+@enduml

@@ -1,0 +1,436 @@
+@startuml Bulkhead Pattern - Isolamento de Recursos
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Bulkhead Pattern - Thread Pools Isolados
+
+actor "Cliente\nCrítico" as critical_client
+actor "Cliente\nNormal" as normal_client
+actor "Cliente\nBatch" as batch_client
+
+box "API Gateway" #LightBlue
+  participant "Request Router" as router
+end box
+
+box "Thread Pool - Critical (10 threads)" #LightGreen
+  participant "Critical\nExecutor" as critical_pool
+  collections "Threads\n1-10" as critical_threads
+end box
+
+box "Thread Pool - Normal (20 threads)" #LightYellow
+  participant "Normal\nExecutor" as normal_pool
+  collections "Threads\n11-30" as normal_threads
+end box
+
+box "Thread Pool - Batch (5 threads)" #LightCoral
+  participant "Batch\nExecutor" as batch_pool
+  collections "Threads\n31-35" as batch_threads
+end box
+
+participant "Order\nService" as service
+database "Database\nPool" as db
+
+== Configuração dos Bulkheads ==
+
+router -> critical_pool: configure(\n  corePoolSize: 10,\n  maxPoolSize: 10,\n  queueCapacity: 50)
+critical_pool --> router: configured
+
+router -> normal_pool: configure(\n  corePoolSize: 20,\n  maxPoolSize: 20,\n  queueCapacity: 100)
+normal_pool --> router: configured
+
+router -> batch_pool: configure(\n  corePoolSize: 5,\n  maxPoolSize: 5,\n  queueCapacity: 200)
+batch_pool --> router: configured
+
+note right of router
+  Isolamento de Recursos:
+  - Critical: 10 threads (alta prioridade)
+  - Normal: 20 threads (uso geral)
+  - Batch: 5 threads (baixa prioridade)
+  
+  Total: 35 threads dedicados
+  Falha em um pool não afeta outros
+end note
+
+== Requisições Concorrentes (Operação Normal) ==
+
+critical_client -> router: POST /orders/urgent
+activate router
+router -> router: classify(request)
+router -> router: priority = CRITICAL
+router -> critical_pool: submit(task)
+activate critical_pool
+critical_pool -> critical_threads: execute
+activate critical_threads
+critical_threads -> service: processOrder(urgent=true)
+activate service
+service -> db: save order
+db --> service: saved
+service --> critical_threads: OrderResponse
+deactivate service
+critical_threads --> critical_pool: completed
+deactivate critical_threads
+critical_pool --> router: result
+deactivate critical_pool
+router --> critical_client: 201 Created
+deactivate router
+
+note right of critical_pool
+  Thread Pool Critical:
+  - Active: 1/10
+  - Queue: 0/50
+  - Estado: HEALTHY
+end note
+
+normal_client -> router: GET /orders/{id}
+activate router
+router -> router: classify(request)
+router -> router: priority = NORMAL
+router -> normal_pool: submit(task)
+activate normal_pool
+normal_pool -> normal_threads: execute
+activate normal_threads
+normal_threads -> service: getOrder(id)
+activate service
+service -> db: query order
+db --> service: order data
+service --> normal_threads: OrderResponse
+deactivate service
+normal_threads --> normal_pool: completed
+deactivate normal_threads
+normal_pool --> router: result
+deactivate normal_pool
+router --> normal_client: 200 OK
+deactivate router
+
+note right of normal_pool
+  Thread Pool Normal:
+  - Active: 1/20
+  - Queue: 0/100
+  - Estado: HEALTHY
+end note
+
+batch_client -> router: POST /orders/batch/export
+activate router
+router -> router: classify(request)
+router -> router: priority = BATCH
+router -> batch_pool: submit(task)
+activate batch_pool
+batch_pool -> batch_threads: execute
+activate batch_threads
+batch_threads -> service: exportOrders()
+activate service
+service -> db: query all orders
+db --> service: large dataset
+service --> batch_threads: CSV file
+deactivate service
+batch_threads --> batch_pool: completed
+deactivate batch_threads
+batch_pool --> router: result
+deactivate batch_pool
+router --> batch_client: 200 OK (file)
+deactivate router
+
+note right of batch_pool
+  Thread Pool Batch:
+  - Active: 1/5
+  - Queue: 0/200
+  - Estado: HEALTHY
+end note
+
+== Cenário de Sobrecarga: Batch Pool Saturado ==
+
+loop 50 requisições batch simultâneas
+  batch_client -> router: POST /orders/batch/export
+  activate router
+  router -> batch_pool: submit(task)
+  activate batch_pool
+  
+  alt Threads disponíveis (1-5)
+    batch_pool -> batch_threads: execute
+    activate batch_threads
+    batch_threads -> service: exportOrders()
+    service --> batch_threads: processing...
+  else Queue tem espaço (6-205)
+    batch_pool -> batch_pool: enqueue task
+    note right of batch_pool
+      Task aguardando na fila
+      Position: 46/200
+    end note
+  else Queue cheia (>205)
+    batch_pool --> router: ❌ RejectedExecutionException
+    router --> batch_client: ❌ 503 Service Unavailable\n(Batch queue full, retry later)
+    deactivate router
+  end
+  
+  deactivate batch_pool
+end
+
+note right of batch_pool
+  Thread Pool Batch SATURADO:
+  - Active: 5/5 (100%)
+  - Queue: 200/200 (100%)
+  - Estado: SATURATED
+  - Novas requisições rejeitadas
+  
+  ⚠️ Mas Critical e Normal pools
+  continuam funcionando normalmente!
+end note
+
+== Durante Saturação do Batch: Critical Funciona ==
+
+critical_client -> router: POST /orders/urgent
+activate router
+router -> router: classify(request)
+router -> router: priority = CRITICAL
+router -> critical_pool: submit(task)
+activate critical_pool
+
+note right of critical_pool
+  Thread Pool Critical:
+  - Active: 2/10
+  - Queue: 0/50
+  - Estado: HEALTHY ✅
+  
+  ISOLADO do problema no Batch!
+end note
+
+critical_pool -> critical_threads: execute
+activate critical_threads
+critical_threads -> service: processOrder(urgent=true)
+activate service
+service -> db: save order
+db --> service: saved
+service --> critical_threads: OrderResponse
+deactivate service
+critical_threads --> critical_pool: completed
+deactivate critical_threads
+critical_pool --> router: result
+deactivate critical_pool
+router --> critical_client: 201 Created ✅
+deactivate router
+
+note right of critical_client
+  Pedido crítico processado com sucesso!
+  
+  Mesmo com Batch pool saturado,
+  Critical pool permanece saudável.
+  
+  **Isolamento de Falhas** funcionando! ✅
+end note
+
+== Durante Saturação do Batch: Normal Funciona ==
+
+normal_client -> router: GET /orders/{id}
+activate router
+router -> normal_pool: submit(task)
+activate normal_pool
+
+note right of normal_pool
+  Thread Pool Normal:
+  - Active: 5/20
+  - Queue: 3/100
+  - Estado: HEALTHY ✅
+  
+  Também ISOLADO do problema!
+end note
+
+normal_pool -> normal_threads: execute
+activate normal_threads
+normal_threads -> service: getOrder(id)
+activate service
+service -> db: query order
+db --> service: order data
+service --> normal_threads: OrderResponse
+deactivate service
+normal_threads --> normal_pool: completed
+deactivate normal_threads
+normal_pool --> router: result
+deactivate normal_pool
+router --> normal_client: 200 OK ✅
+deactivate router
+
+== Recuperação do Batch Pool ==
+
+loop Threads finalizando tarefas batch
+  batch_threads -> batch_threads: finish export
+  deactivate batch_threads
+  batch_pool -> batch_pool: thread available
+  batch_pool -> batch_pool: dequeue next task
+  batch_pool -> batch_threads: execute
+  activate batch_threads
+  note right of batch_pool
+    Thread Pool Batch recuperando:
+    - Active: 5/5
+    - Queue: 150/200 (diminuindo)
+    - Estado: RECOVERING
+  end note
+end
+
+... Após processar fila ...
+
+note right of batch_pool
+  Thread Pool Batch normalizado:
+  - Active: 2/5
+  - Queue: 0/200
+  - Estado: HEALTHY ✅
+  
+  Sistema voltou ao normal
+end note
+
+== Cenário Extremo: Database Latency ==
+
+group Database com alta latência
+  critical_client -> router: POST /orders/urgent
+  activate router
+  router -> critical_pool: submit(task)
+  activate critical_pool
+  critical_pool -> critical_threads: execute
+  activate critical_threads
+  critical_threads -> service: processOrder()
+  activate service
+  service -> db: save order
+  activate db
+  db -> db: ⏱️ latência alta (5s)
+  note right of db
+    Database sobrecarregado:
+    - Queries lentas
+    - Connections pool quase cheio
+    - Impacta TODAS as threads
+  end note
+  db --> service: saved (após 5s)
+  deactivate db
+  service --> critical_threads: response
+  deactivate service
+  critical_threads --> critical_pool: completed
+  deactivate critical_threads
+  critical_pool --> router: result
+  deactivate critical_pool
+  router --> critical_client: 201 Created (5s delay)
+  deactivate router
+  
+  note right of critical_pool
+    ⚠️ Problema:
+    Bulkhead protege entre pools,
+    MAS todos pools compartilham
+    mesmo Database Connection Pool.
+    
+    Solução: Bulkhead também no DB!
+    - Critical DB Pool: 20 connections
+    - Normal DB Pool: 30 connections
+    - Batch DB Pool: 10 connections
+  end note
+end
+
+== Bulkhead no Database (Avançado) ==
+
+note over db
+  **Database Connection Pools Isolados:**
+  
+  spring.datasource.hikari.pools:
+    critical:
+      pool-name: CriticalPool
+      maximum-pool-size: 20
+      minimum-idle: 10
+      connection-timeout: 5000
+    
+    normal:
+      pool-name: NormalPool
+      maximum-pool-size: 30
+      minimum-idle: 15
+      connection-timeout: 10000
+    
+    batch:
+      pool-name: BatchPool
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+  
+  **Roteamento por Prioridade:**
+  - Critical requests → CriticalPool
+  - Normal requests → NormalPool
+  - Batch requests → BatchPool
+  
+  **Isolamento completo end-to-end!**
+end note
+
+== Métricas e Alertas ==
+
+router -> router: recordMetrics()
+note right of router
+  **Métricas por Pool:**
+  
+  bulkhead.pool.active.threads
+    {pool: "critical"} = 2/10
+    {pool: "normal"} = 5/20
+    {pool: "batch"} = 5/5
+  
+  bulkhead.pool.queue.size
+    {pool: "critical"} = 0/50
+    {pool: "normal"} = 3/100
+    {pool: "batch"} = 200/200 ⚠️
+  
+  bulkhead.pool.rejected.total
+    {pool: "batch"} = 45 ⚠️
+  
+  bulkhead.pool.completed.tasks
+    {pool: "critical"} = 1523
+    {pool: "normal"} = 8942
+    {pool: "batch"} = 234
+  
+  **Alertas:**
+  - Queue > 80% → Warning
+  - Queue = 100% → Critical
+  - Rejected > 10/min → Critical
+  - Active = Max → Warning
+end note
+
+== Configuração Resilience4j ==
+
+note over critical_pool, batch_pool
+  **Resilience4j Bulkhead Config (application.yml):**
+  
+  ```yaml
+  resilience4j:
+    bulkhead:
+      instances:
+        critical:
+          max-concurrent-calls: 10
+          max-wait-duration: 5s
+        normal:
+          max-concurrent-calls: 20
+          max-wait-duration: 10s
+        batch:
+          max-concurrent-calls: 5
+          max-wait-duration: 30s
+    
+    thread-pool-bulkhead:
+      instances:
+        critical:
+          core-thread-pool-size: 10
+          max-thread-pool-size: 10
+          queue-capacity: 50
+          keep-alive-duration: 20s
+        normal:
+          core-thread-pool-size: 20
+          max-thread-pool-size: 20
+          queue-capacity: 100
+          keep-alive-duration: 20s
+        batch:
+          core-thread-pool-size: 5
+          max-thread-pool-size: 5
+          queue-capacity: 200
+          keep-alive-duration: 60s
+  ```
+  
+  **Código Java:**
+  ```java
+  @Bulkhead(name = "critical", 
+            type = Bulkhead.Type.THREADPOOL)
+  public OrderResponse processUrgentOrder(Order order) {
+    return orderService.process(order);
+  }
+  ```
+end note
+
+@enduml

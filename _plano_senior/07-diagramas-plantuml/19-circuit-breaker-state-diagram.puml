@@ -1,0 +1,122 @@
+@startuml Circuit Breaker - State Transitions Diagram
+!theme plain
+skinparam stateDiagramArrowColor #2C3E50
+skinparam stateDiagramBackgroundColor #ECF0F1
+skinparam stateDiagramBorderColor #34495E
+
+title Circuit Breaker Pattern - State Machine View
+
+[*] --> CLOSED : Initialize
+
+state CLOSED {
+  state "Accepting Requests" as closed_accept
+  state "Counting Failures" as closed_count
+  
+  [*] --> closed_accept
+  closed_accept --> closed_count : Request fails
+  closed_count --> closed_accept : Request succeeds\n(reset counter)
+}
+
+state OPEN {
+  state "Rejecting Requests" as open_reject
+  state "Timer Running" as open_timer
+  
+  [*] --> open_reject
+  open_reject --> open_timer : Wait for timeout
+}
+
+state HALF_OPEN {
+  state "Testing Service" as half_test
+  state "Evaluating" as half_eval
+  
+  [*] --> half_test
+  half_test --> half_eval : Send test requests
+}
+
+CLOSED --> OPEN : Failure threshold\nreached\n(e.g., 3/5 failures)
+
+note right of OPEN
+  **OPEN State:**
+  - All requests fail fast
+  - No calls to service
+  - Timer starts (e.g., 60s)
+  - Prevents cascading failures
+  
+  **Metrics:**
+  - calls.not_permitted++
+  - state.transitions++
+end note
+
+OPEN --> HALF_OPEN : Timer expires\n(cooldown period over)
+
+note right of HALF_OPEN
+  **HALF_OPEN State:**
+  - Limited test requests
+  - Evaluating service health
+  - Collecting success metrics
+  
+  **Test Configuration:**
+  - permitted_calls: 3-10
+  - success_threshold: 50-80%
+end note
+
+HALF_OPEN --> CLOSED : Success threshold\nreached\n(service recovered)
+
+note left of CLOSED
+  **CLOSED State:**
+  - Normal operation
+  - All requests allowed
+  - Monitoring failures
+  - Sliding window tracking
+  
+  **Sliding Window:**
+  - Count-based: Last N calls
+  - Time-based: Last M seconds
+end note
+
+HALF_OPEN --> OPEN : Any failure detected\n(service still unhealthy)
+
+CLOSED --> CLOSED : Successful requests\n(reset failure count)
+OPEN --> OPEN : Requests rejected\n(timer not expired)
+
+note bottom
+  **Circuit Breaker Configuration (Resilience4j):**
+  
+  ```yaml
+  resilience4j.circuitbreaker:
+    instances:
+      paymentService:
+        failure-rate-threshold: 50
+        minimum-number-of-calls: 5
+        wait-duration-in-open-state: 60s
+        permitted-number-of-calls-in-half-open-state: 3
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        automatic-transition-from-open-to-half-open-enabled: true
+  ```
+  
+  **State Transition Conditions:**
+  
+  CLOSED → OPEN:
+  - failure_rate >= 50% AND
+  - calls >= 5 (minimum threshold)
+  
+  OPEN → HALF_OPEN:
+  - wait_duration elapsed (60s)
+  
+  HALF_OPEN → CLOSED:
+  - success_rate >= 50% AND
+  - test_calls >= 3
+  
+  HALF_OPEN → OPEN:
+  - Any single failure
+  - OR success_rate < 50%
+  
+  **Benefits:**
+  - Fast failure (no waiting)
+  - Service protection
+  - Automatic recovery
+  - Cascading failure prevention
+end note
+
+@enduml

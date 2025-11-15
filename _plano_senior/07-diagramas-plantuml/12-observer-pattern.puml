@@ -1,0 +1,616 @@
+@startuml Observer Pattern - Event Notification
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Observer Pattern - Order Status Notifications
+
+participant "OrderService\n(Subject)" as subject
+collections "Observers\nList" as observers_list
+participant "EmailNotification\n(Observer)" as email_observer
+participant "SMSNotification\n(Observer)" as sms_observer
+participant "PushNotification\n(Observer)" as push_observer
+participant "Analytics\n(Observer)" as analytics_observer
+participant "EmailService" as email_service
+participant "SMSGateway" as sms_gateway
+participant "PushService" as push_service
+database "Analytics DB" as analytics_db
+
+== Observer Registration ==
+
+email_observer -> subject: registerObserver(emailObserver)
+activate email_observer
+activate subject
+
+subject -> observers_list: add(emailObserver)
+activate observers_list
+observers_list --> subject: added
+deactivate observers_list
+
+subject --> email_observer: registered
+deactivate subject
+deactivate email_observer
+
+note right of subject
+  **Subject (Observable):**
+  ```java
+  public class OrderService {
+    private List<OrderObserver> observers 
+      = new ArrayList<>();
+    
+    public void registerObserver(
+      OrderObserver observer
+    ) {
+      observers.add(observer);
+    }
+    
+    public void removeObserver(
+      OrderObserver observer
+    ) {
+      observers.remove(observer);
+    }
+    
+    private void notifyObservers(
+      OrderEvent event
+    ) {
+      for (OrderObserver observer : 
+           observers) {
+        observer.update(event);
+      }
+    }
+  }
+  ```
+end note
+
+sms_observer -> subject: registerObserver(smsObserver)
+activate sms_observer
+activate subject
+subject -> observers_list: add(smsObserver)
+observers_list --> subject: added
+subject --> sms_observer: registered
+deactivate subject
+deactivate sms_observer
+
+push_observer -> subject: registerObserver(pushObserver)
+activate push_observer
+activate subject
+subject -> observers_list: add(pushObserver)
+observers_list --> subject: added
+subject --> push_observer: registered
+deactivate subject
+deactivate push_observer
+
+analytics_observer -> subject: registerObserver(analyticsObserver)
+activate analytics_observer
+activate subject
+subject -> observers_list: add(analyticsObserver)
+observers_list --> subject: added
+subject --> analytics_observer: registered
+deactivate subject
+deactivate analytics_observer
+
+note right of observers_list
+  **Registered Observers:**
+  1. EmailNotificationObserver
+  2. SMSNotificationObserver
+  3. PushNotificationObserver
+  4. AnalyticsObserver
+  
+  All will be notified of changes!
+end note
+
+== Event: Order Created ==
+
+actor Cliente as client
+
+client -> subject: createOrder(orderRequest)
+activate client
+activate subject
+
+subject -> subject: validate(orderRequest)
+subject -> subject: save order to DB
+
+subject -> subject: orderCreated = true\norder.status = PENDING
+
+note right of subject
+  **State Changed:**
+  - Order created
+  - Status: PENDING
+  - Time to notify observers!
+end note
+
+subject -> subject: notifyObservers(\n  OrderCreatedEvent)
+
+subject -> observers_list: for each observer
+activate observers_list
+
+loop for each observer
+  observers_list -> email_observer: update(\n  OrderCreatedEvent)
+  activate email_observer
+  
+  email_observer -> email_observer: should handle?\n  event.type == CREATED? YES
+  
+  email_observer -> email_service: sendEmail(\n  to: customer.email,\n  subject: "Order Confirmed",\n  body: "Your order #123...")
+  activate email_service
+  
+  note right of email_service
+    **Email Content:**
+    To: customer@example.com
+    Subject: Order Confirmed
+    
+    Hello John,
+    
+    Your order #123 has been confirmed!
+    Total: $150.00
+    Estimated delivery: 3-5 days
+    
+    Thank you for your purchase!
+  end note
+  
+  email_service --> email_observer: email sent ✅
+  deactivate email_service
+  
+  email_observer --> observers_list: updated
+  deactivate email_observer
+  
+  observers_list -> sms_observer: update(\n  OrderCreatedEvent)
+  activate sms_observer
+  
+  sms_observer -> sms_observer: should handle?\n  customer.wantsSMS? YES
+  
+  sms_observer -> sms_gateway: sendSMS(\n  to: customer.phone,\n  message: "Order #123 confirmed...")
+  activate sms_gateway
+  
+  note right of sms_gateway
+    **SMS Content:**
+    To: +55 11 98765-4321
+    
+    Order #123 confirmed!
+    Total: $150.00
+    Track: http://example.com/track/123
+  end note
+  
+  sms_gateway --> sms_observer: SMS sent ✅
+  deactivate sms_gateway
+  
+  sms_observer --> observers_list: updated
+  deactivate sms_observer
+  
+  observers_list -> push_observer: update(\n  OrderCreatedEvent)
+  activate push_observer
+  
+  push_observer -> push_observer: should handle?\n  customer.hasApp? YES
+  
+  push_observer -> push_service: sendPush(\n  deviceId: customer.deviceId,\n  title: "Order Confirmed",\n  body: "Order #123 confirmed!")
+  activate push_service
+  
+  note right of push_service
+    **Push Notification:**
+    Title: Order Confirmed
+    Body: Order #123 confirmed! $150.00
+    Icon: ✅
+    Action: Open app to track
+  end note
+  
+  push_service --> push_observer: push sent ✅
+  deactivate push_service
+  
+  push_observer --> observers_list: updated
+  deactivate push_observer
+  
+  observers_list -> analytics_observer: update(\n  OrderCreatedEvent)
+  activate analytics_observer
+  
+  analytics_observer -> analytics_observer: extract metrics
+  
+  analytics_observer -> analytics_db: INSERT INTO order_events\n(order_id, event_type,\n customer_id, amount,\n timestamp)\nVALUES\n('123', 'CREATED',\n 'CUST-456', 150.00,\n NOW())
+  activate analytics_db
+  
+  note right of analytics_db
+    **Analytics Tracking:**
+    - Order created count
+    - Revenue tracking
+    - Customer behavior
+    - Conversion metrics
+  end note
+  
+  analytics_db --> analytics_observer: inserted
+  deactivate analytics_db
+  
+  analytics_observer --> observers_list: updated
+  deactivate analytics_observer
+end
+
+observers_list --> subject: all observers notified
+deactivate observers_list
+
+subject --> client: OrderResponse(\n  orderId: "123",\n  status: CREATED)
+deactivate subject
+deactivate client
+
+note right of client
+  **Observer Benefits:**
+  - Client unaware of observers
+  - Notifications happen automatically
+  - Easy to add new observers
+  - Loose coupling
+end note
+
+== Event: Order Shipped ==
+
+actor System as system
+
+system -> subject: shipOrder("123")
+activate system
+activate subject
+
+subject -> subject: validate can ship
+subject -> subject: order.status = SHIPPED
+subject -> subject: order.trackingNumber = "TRK-789"
+
+subject -> subject: notifyObservers(\n  OrderShippedEvent)
+
+subject -> observers_list: for each observer
+activate observers_list
+
+loop for each observer
+  observers_list -> email_observer: update(\n  OrderShippedEvent)
+  activate email_observer
+  
+  email_observer -> email_observer: should handle? YES
+  
+  email_observer -> email_service: sendEmail(\n  subject: "Order Shipped",\n  body: "Tracking: TRK-789...")
+  activate email_service
+  email_service --> email_observer: email sent
+  deactivate email_service
+  
+  email_observer --> observers_list: updated
+  deactivate email_observer
+  
+  observers_list -> sms_observer: update(\n  OrderShippedEvent)
+  activate sms_observer
+  
+  sms_observer -> sms_observer: should handle? YES
+  
+  sms_observer -> sms_gateway: sendSMS(\n  "Order shipped! TRK-789")
+  activate sms_gateway
+  sms_gateway --> sms_observer: SMS sent
+  deactivate sms_gateway
+  
+  sms_observer --> observers_list: updated
+  deactivate sms_observer
+  
+  observers_list -> push_observer: update(\n  OrderShippedEvent)
+  activate push_observer
+  
+  push_observer -> push_observer: should handle? YES
+  
+  push_observer -> push_service: sendPush(\n  "Your order is on the way!")
+  activate push_service
+  push_service --> push_observer: push sent
+  deactivate push_service
+  
+  push_observer --> observers_list: updated
+  deactivate push_observer
+  
+  observers_list -> analytics_observer: update(\n  OrderShippedEvent)
+  activate analytics_observer
+  
+  analytics_observer -> analytics_db: INSERT INTO order_events\n(..., 'SHIPPED', ...)
+  activate analytics_db
+  analytics_db --> analytics_observer: inserted
+  deactivate analytics_db
+  
+  analytics_observer --> observers_list: updated
+  deactivate analytics_observer
+end
+
+observers_list --> subject: all notified
+deactivate observers_list
+
+subject --> system: order shipped
+deactivate subject
+deactivate system
+
+note right of system
+  **Same Observers, Different Event:**
+  - All observers reused
+  - Each handles event differently
+  - Extensible
+end note
+
+== Adding New Observer at Runtime ==
+
+participant "WebhookObserver" as webhook_observer
+participant "Webhook API" as webhook_api
+
+webhook_observer -> subject: registerObserver(\n  webhookObserver)
+activate webhook_observer
+activate subject
+
+subject -> observers_list: add(webhookObserver)
+activate observers_list
+observers_list --> subject: added
+deactivate observers_list
+
+subject --> webhook_observer: registered
+deactivate subject
+deactivate webhook_observer
+
+note right of webhook_observer
+  **New Observer Added:**
+  - No changes to OrderService
+  - No changes to existing observers
+  - Immediately starts receiving events
+  
+  **Open/Closed Principle!**
+end note
+
+system -> subject: deliverOrder("123")
+activate system
+activate subject
+
+subject -> subject: order.status = DELIVERED
+
+subject -> subject: notifyObservers(\n  OrderDeliveredEvent)
+
+subject -> observers_list: for each observer
+activate observers_list
+
+note right of observers_list
+  **Now 5 observers:**
+  1. Email
+  2. SMS
+  3. Push
+  4. Analytics
+  5. Webhook (NEW!)
+end note
+
+loop for each observer (including new webhook)
+  observers_list -> webhook_observer: update(\n  OrderDeliveredEvent)
+  activate webhook_observer
+  
+  webhook_observer -> webhook_observer: should handle? YES
+  
+  webhook_observer -> webhook_api: POST /webhooks/order-delivered\n{\n  "orderId": "123",\n  "status": "DELIVERED"\n}
+  activate webhook_api
+  
+  note right of webhook_api
+    **Webhook Call:**
+    POST https://partner.com/webhooks
+    
+    {
+      "event": "order.delivered",
+      "orderId": "123",
+      "customerId": "CUST-456",
+      "deliveredAt": "2025-11-15T15:30:00Z"
+    }
+  end note
+  
+  webhook_api --> webhook_observer: 200 OK
+  deactivate webhook_api
+  
+  webhook_observer --> observers_list: updated
+  deactivate webhook_observer
+  
+  observers_list -> email_observer: update(OrderDeliveredEvent)
+  activate email_observer
+  email_observer -> email_service: sendEmail(...)
+  email_service --> email_observer: sent
+  email_observer --> observers_list: updated
+  deactivate email_observer
+  
+  note over sms_observer, analytics_observer
+    ... outros observers também notificados ...
+  end note
+end
+
+observers_list --> subject: all notified
+deactivate observers_list
+
+subject --> system: order delivered
+deactivate subject
+deactivate system
+
+== Removing Observer ==
+
+sms_observer -> subject: removeObserver(smsObserver)
+activate sms_observer
+activate subject
+
+subject -> observers_list: remove(smsObserver)
+activate observers_list
+observers_list --> subject: removed
+deactivate observers_list
+
+subject --> sms_observer: unregistered
+deactivate subject
+deactivate sms_observer
+
+note right of sms_observer
+  **Observer Removed:**
+  - No more SMS notifications
+  - Other observers unaffected
+  - Dynamic subscription
+end note
+
+system -> subject: cancelOrder("124")
+activate system
+activate subject
+
+subject -> subject: order.status = CANCELLED
+
+subject -> subject: notifyObservers(\n  OrderCancelledEvent)
+
+subject -> observers_list: for each observer
+activate observers_list
+
+note right of observers_list
+  **Now 4 observers:**
+  1. Email ✅
+  2. SMS ❌ (removed)
+  3. Push ✅
+  4. Analytics ✅
+  5. Webhook ✅
+end note
+
+loop for each remaining observer (SMS skipped)
+  observers_list -> email_observer: update(OrderCancelledEvent)
+  activate email_observer
+  email_observer -> email_service: sendEmail(\n  "Order cancelled...")
+  email_service --> email_observer: sent
+  email_observer --> observers_list: updated
+  deactivate email_observer
+  
+  note over push_observer, webhook_observer
+    ... outros observers notificados ...
+    ... mas SMS NÃO é chamado ...
+  end note
+end
+
+observers_list --> subject: all notified (SMS skipped)
+deactivate observers_list
+
+subject --> system: order cancelled
+deactivate subject
+deactivate system
+
+== Spring Event-Driven Observer ==
+
+note over subject, analytics_observer
+  **Spring Application Events:**
+  
+  ```java
+  // Event
+  public class OrderCreatedEvent 
+    extends ApplicationEvent {
+    private final Order order;
+    
+    public OrderCreatedEvent(
+      Object source, Order order
+    ) {
+      super(source);
+      this.order = order;
+    }
+  }
+  
+  // Publisher (Subject)
+  @Service
+  public class OrderService {
+    @Autowired
+    private ApplicationEventPublisher 
+      publisher;
+    
+    public Order createOrder(
+      OrderRequest request
+    ) {
+      Order order = saveOrder(request);
+      
+      // Publish event
+      publisher.publishEvent(
+        new OrderCreatedEvent(this, order)
+      );
+      
+      return order;
+    }
+  }
+  
+  // Observer 1
+  @Component
+  public class EmailNotificationListener {
+    @EventListener
+    public void handle(
+      OrderCreatedEvent event
+    ) {
+      sendEmail(event.getOrder());
+    }
+  }
+  
+  // Observer 2
+  @Component
+  public class AnalyticsListener {
+    @EventListener
+    @Async // Non-blocking!
+    public void handle(
+      OrderCreatedEvent event
+    ) {
+      trackEvent(event.getOrder());
+    }
+  }
+  ```
+  
+  **Spring Benefits:**
+  - Auto-discovery of @EventListener
+  - Async support (@Async)
+  - Transaction-aware (@TransactionalEventListener)
+  - Type-safe events
+end note
+
+== Benefits & Trade-offs ==
+
+note over email_observer, analytics_observer
+  **Benefits:**
+  
+  ✅ **Loose Coupling:**
+  - Subject doesn't know observers
+  - Observers don't know each other
+  - Easy to add/remove
+  
+  ✅ **Open/Closed:**
+  - New observers without changing subject
+  - Extensible
+  
+  ✅ **Dynamic Subscription:**
+  - Register/unregister at runtime
+  - Flexible
+  
+  ✅ **Broadcast:**
+  - One event, many handlers
+  - No conditional logic
+  
+  **Trade-offs:**
+  
+  ⚠️ **Performance:**
+  - Synchronous by default
+  - Can block if observer slow
+  - Solution: async observers
+  
+  ⚠️ **Memory Leaks:**
+  - Forgot to unregister?
+  - Observer kept in memory
+  - Solution: weak references
+  
+  ⚠️ **Order Unpredictable:**
+  - Observer execution order undefined
+  - Don't rely on order
+  - Solution: priority/ordering
+  
+  ⚠️ **Error Handling:**
+  - One observer fails → all fail?
+  - Solution: try/catch each observer
+  
+  **Use Cases:**
+  
+  - **Event Notification:** (this example)
+  - **GUI Events:** Button click, form submit
+  - **Monitoring:** Logging, metrics, tracing
+  - **Caching:** Cache invalidation
+  - **Audit Trail:** Track changes
+  - **Email/SMS:** User actions
+  - **Webhooks:** External integrations
+  - **Real-time Updates:** WebSocket broadcasts
+  
+  **When to Use:**
+  - One-to-many dependency
+  - Broadcast changes
+  - Decoupled notification
+  - Plugin architecture
+  
+  **When NOT to Use:**
+  - One-to-one relationship
+  - Simple callback sufficient
+  - Performance critical
+  - Need guaranteed order
+end note
+
+@enduml

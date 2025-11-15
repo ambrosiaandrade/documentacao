@@ -1,0 +1,521 @@
+@startuml Hexagonal Architecture - Ports and Adapters
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Hexagonal Architecture (Ports & Adapters) - Clean Architecture
+
+actor "Cliente\nWeb" as web_client
+actor "Cliente\nMobile" as mobile_client
+participant "REST\nController\n(Adapter)" as rest_controller
+participant "GraphQL\nResolver\n(Adapter)" as graphql_resolver
+
+box "Primary Ports (Input)" #LightBlue
+  participant "OrderService\nPort\n(Interface)" as order_port
+end box
+
+box "Core Domain (Business Logic)" #LightGreen
+  participant "OrderService\nImpl" as order_service
+  participant "Order\n(Entity)" as order_entity
+  participant "OrderValidator" as validator
+  participant "PricingEngine" as pricing
+end box
+
+box "Secondary Ports (Output)" #LightYellow
+  participant "OrderRepository\nPort\n(Interface)" as repo_port
+  participant "PaymentGateway\nPort\n(Interface)" as payment_port
+  participant "NotificationService\nPort\n(Interface)" as notification_port
+end box
+
+participant "JPA Repository\n(Adapter)" as jpa_adapter
+participant "Stripe Client\n(Adapter)" as stripe_adapter
+participant "Email Service\n(Adapter)" as email_adapter
+database "PostgreSQL" as postgres
+participant "Stripe API" as stripe
+participant "SMTP Server" as smtp
+
+== Request via REST (Web Client) ==
+
+web_client -> rest_controller: POST /api/orders\n{"customerId": "123", "items": [...]}
+activate rest_controller
+
+rest_controller -> rest_controller: mapToDTO(request)
+rest_controller -> rest_controller: validate(dto)
+
+note right of rest_controller
+  **REST Adapter (Primary):**
+  - Recebe HTTP request
+  - Converte JSON → DTO
+  - Valida formato
+  - Mapeia DTO → Domain Command
+end note
+
+rest_controller -> order_port: createOrder(\n  CreateOrderCommand)
+activate order_port
+
+note right of order_port
+  **Primary Port (Interface):**
+  
+  ```java
+  public interface OrderServicePort {
+    OrderResult createOrder(
+      CreateOrderCommand command
+    );
+    
+    Order findById(OrderId id);
+    
+    void cancelOrder(OrderId id);
+  }
+  ```
+  
+  - Define USE CASES
+  - Independente de tecnologia
+  - Driven by business
+end note
+
+order_port -> order_service: createOrder(command)
+activate order_service
+
+== Core Domain Logic ==
+
+order_service -> validator: validate(command)
+activate validator
+validator -> validator: checkCustomerExists()
+validator -> validator: checkItemsAvailability()
+validator -> validator: checkBusinessRules()
+validator --> order_service: ValidationResult.valid()
+deactivate validator
+
+note right of order_service
+  **Core Domain:**
+  - Business logic pura
+  - Sem dependências externas
+  - Testável sem infraestrutura
+  - Usa apenas Ports (interfaces)
+end note
+
+order_service -> order_entity: create(\n  customerId,\n  items)
+activate order_entity
+
+order_entity -> order_entity: generateOrderId()
+order_entity -> order_entity: setStatus(PENDING)
+order_entity -> order_entity: calculateSubtotal()
+
+order_entity -> pricing: calculateTotal(\n  items,\n  customerId)
+activate pricing
+pricing -> pricing: applyDiscounts()
+pricing -> pricing: applyTaxes()
+pricing -> pricing: applyShipping()
+pricing --> order_entity: totalAmount
+deactivate pricing
+
+order_entity -> order_entity: setTotalAmount(totalAmount)
+order_entity --> order_service: Order (aggregate)
+deactivate order_entity
+
+note right of order_entity
+  **Domain Entity:**
+  - Rich domain model
+  - Encapsula business logic
+  - Invariants protegidos
+  - No annotations de frameworks
+  
+  ```java
+  public class Order {
+    private OrderId id;
+    private CustomerId customerId;
+    private List<OrderItem> items;
+    private Money totalAmount;
+    private OrderStatus status;
+    
+    public void addItem(OrderItem item) {
+      validateItem(item);
+      items.add(item);
+      recalculateTotal();
+    }
+  }
+  ```
+end note
+
+== Persistence via Secondary Port ==
+
+order_service -> repo_port: save(order)
+activate repo_port
+
+note right of repo_port
+  **Secondary Port (Interface):**
+  
+  ```java
+  public interface OrderRepositoryPort {
+    Order save(Order order);
+    
+    Optional<Order> findById(OrderId id);
+    
+    List<Order> findByCustomerId(
+      CustomerId customerId
+    );
+  }
+  ```
+  
+  - Domain define o que precisa
+  - Infraestrutura implementa como
+  - Inversão de dependência
+end note
+
+repo_port -> jpa_adapter: save(order)
+activate jpa_adapter
+
+jpa_adapter -> jpa_adapter: mapToEntity(order)
+note right of jpa_adapter
+  **JPA Adapter (Secondary):**
+  - Implementa Repository Port
+  - Converte Domain → JPA Entity
+  - Isola tecnologia de persistência
+  
+  ```java
+  @Repository
+  class JpaOrderAdapter 
+    implements OrderRepositoryPort {
+    
+    @Autowired
+    private OrderJpaRepository jpaRepo;
+    
+    public Order save(Order domain) {
+      OrderEntity entity = 
+        mapper.toEntity(domain);
+      OrderEntity saved = 
+        jpaRepo.save(entity);
+      return mapper.toDomain(saved);
+    }
+  }
+  ```
+end note
+
+jpa_adapter -> postgres: INSERT INTO orders...
+activate postgres
+postgres --> jpa_adapter: row inserted
+deactivate postgres
+
+jpa_adapter -> jpa_adapter: mapToDomain(entity)
+jpa_adapter --> repo_port: Order (persisted)
+deactivate jpa_adapter
+
+repo_port --> order_service: Order
+deactivate repo_port
+
+== Payment via Secondary Port ==
+
+order_service -> payment_port: processPayment(\n  orderId,\n  amount)
+activate payment_port
+
+note right of payment_port
+  **Secondary Port (Interface):**
+  
+  ```java
+  public interface PaymentGatewayPort {
+    PaymentResult processPayment(
+      OrderId orderId,
+      Money amount
+    );
+    
+    void refund(PaymentId paymentId);
+  }
+  ```
+  
+  - Domain não conhece Stripe
+  - Pode trocar gateway facilmente
+  - Testável com mocks
+end note
+
+payment_port -> stripe_adapter: processPayment(\n  orderId, amount)
+activate stripe_adapter
+
+stripe_adapter -> stripe_adapter: mapToStripeRequest()
+stripe_adapter -> stripe: POST /v1/charges
+activate stripe
+stripe -> stripe: validate card
+stripe -> stripe: authorize amount
+stripe --> stripe_adapter: charge successful
+deactivate stripe
+
+stripe_adapter -> stripe_adapter: mapToDomain(response)
+stripe_adapter --> payment_port: PaymentResult(\n  paymentId,\n  APPROVED)
+deactivate stripe_adapter
+
+payment_port --> order_service: PaymentResult
+deactivate payment_port
+
+order_service -> order_entity: confirmPayment(\n  paymentId)
+activate order_entity
+order_entity -> order_entity: setStatus(CONFIRMED)
+order_entity -> order_entity: setPaymentId(paymentId)
+order_entity --> order_service: Order (updated)
+deactivate order_entity
+
+== Notification via Secondary Port ==
+
+order_service -> notification_port: sendOrderConfirmation(\n  orderId)
+activate notification_port
+
+notification_port -> email_adapter: send(email)
+activate email_adapter
+email_adapter -> smtp: SMTP send
+activate smtp
+smtp --> email_adapter: sent
+deactivate smtp
+email_adapter --> notification_port: sent
+deactivate email_adapter
+
+notification_port --> order_service: notification sent
+deactivate notification_port
+
+order_service --> order_port: OrderResult(\n  orderId,\n  status: CONFIRMED)
+deactivate order_service
+
+order_port --> rest_controller: OrderResult
+deactivate order_port
+
+rest_controller -> rest_controller: mapToResponse(result)
+rest_controller --> web_client: 201 Created\n{"orderId": "ORD-123", ...}
+deactivate rest_controller
+
+== Request via GraphQL (Mobile Client) ==
+
+mobile_client -> graphql_resolver: mutation createOrder {...}
+activate graphql_resolver
+
+graphql_resolver -> graphql_resolver: parseGraphQLInput()
+graphql_resolver -> graphql_resolver: mapToCommand()
+
+note right of graphql_resolver
+  **GraphQL Adapter (Primary):**
+  - Alternativa ao REST
+  - Mesmo Port (OrderServicePort)
+  - Tecnologia diferente, lógica igual
+  
+  ```java
+  @GraphQLMutationResolver
+  class OrderGraphQLResolver {
+    @Autowired
+    private OrderServicePort orderService;
+    
+    public OrderDTO createOrder(
+      CreateOrderInput input
+    ) {
+      CreateOrderCommand cmd = 
+        mapper.toCommand(input);
+      OrderResult result = 
+        orderService.createOrder(cmd);
+      return mapper.toDTO(result);
+    }
+  }
+  ```
+end note
+
+graphql_resolver -> order_port: createOrder(command)
+activate order_port
+
+order_port -> order_service: createOrder(command)
+activate order_service
+
+note right of order_service
+  **Mesma Lógica de Negócio:**
+  - REST e GraphQL usam mesmo Port
+  - Core Domain não muda
+  - Business logic reutilizada
+  - Consistência garantida
+end note
+
+order_service -> validator: validate(command)
+validator --> order_service: valid
+
+order_service -> order_entity: create(...)
+order_entity --> order_service: Order
+
+order_service -> repo_port: save(order)
+repo_port -> jpa_adapter: save(order)
+jpa_adapter -> postgres: INSERT...
+postgres --> jpa_adapter: saved
+jpa_adapter --> repo_port: Order
+repo_port --> order_service: Order
+
+order_service -> payment_port: processPayment(...)
+payment_port -> stripe_adapter: processPayment(...)
+stripe_adapter -> stripe: POST /v1/charges
+stripe --> stripe_adapter: success
+stripe_adapter --> payment_port: PaymentResult
+payment_port --> order_service: PaymentResult
+
+order_service -> notification_port: sendOrderConfirmation(...)
+notification_port -> email_adapter: send(email)
+email_adapter -> smtp: SMTP send
+smtp --> email_adapter: sent
+email_adapter --> notification_port: sent
+notification_port --> order_service: sent
+
+order_service --> order_port: OrderResult
+deactivate order_service
+
+order_port --> graphql_resolver: OrderResult
+deactivate order_port
+
+graphql_resolver -> graphql_resolver: mapToGraphQLResponse()
+graphql_resolver --> mobile_client: {data: {createOrder: {...}}}
+deactivate graphql_resolver
+
+note right of mobile_client
+  **Benefício da Arquitetura:**
+  - Web (REST) e Mobile (GraphQL)
+  - Usam mesma lógica de negócio
+  - Adapters diferentes
+  - Core Domain imutável
+end note
+
+== Testing: Mock Adapters ==
+
+participant "OrderServiceTest" as test
+participant "InMemoryOrderRepo\n(Test Double)" as inmemory_repo
+participant "FakePaymentGateway\n(Test Double)" as fake_payment
+participant "NoOpNotification\n(Test Double)" as noop_notification
+
+test -> order_service: createOrder(command)
+activate order_service
+
+order_service -> repo_port: save(order)
+repo_port -> inmemory_repo: save(order)
+activate inmemory_repo
+inmemory_repo -> inmemory_repo: store in HashMap
+inmemory_repo --> repo_port: Order
+deactivate inmemory_repo
+
+order_service -> payment_port: processPayment(...)
+payment_port -> fake_payment: processPayment(...)
+activate fake_payment
+fake_payment -> fake_payment: always return APPROVED
+fake_payment --> payment_port: PaymentResult(APPROVED)
+deactivate fake_payment
+
+order_service -> notification_port: sendOrderConfirmation(...)
+notification_port -> noop_notification: send(email)
+activate noop_notification
+noop_notification -> noop_notification: do nothing
+noop_notification --> notification_port: sent
+deactivate noop_notification
+
+order_service --> test: OrderResult
+deactivate order_service
+
+note right of test
+  **Testabilidade:**
+  - Core Domain testado sem DB
+  - Sem Stripe real
+  - Sem enviar emails
+  - Testes rápidos (<100ms)
+  - Determinísticos
+  - Isolados
+  
+  ```java
+  @Test
+  void shouldCreateOrder() {
+    // Given
+    OrderRepositoryPort repo = 
+      new InMemoryOrderRepository();
+    PaymentGatewayPort payment = 
+      new FakePaymentGateway();
+    NotificationServicePort notification =
+      new NoOpNotificationService();
+    
+    OrderService service = 
+      new OrderServiceImpl(
+        repo, payment, notification
+      );
+    
+    // When
+    OrderResult result = 
+      service.createOrder(command);
+    
+    // Then
+    assertThat(result.isSuccess())
+      .isTrue();
+  }
+  ```
+end note
+
+== Switching Adapters (No Core Changes) ==
+
+note over stripe_adapter, email_adapter
+  **Trocar Adapters sem Alterar Core:**
+  
+  **Exemplo 1: Trocar Payment Gateway**
+  - Stripe → PayPal
+  - Implementar PayPalAdapter
+  - Implementa PaymentGatewayPort
+  - Core Domain não muda!
+  
+  **Exemplo 2: Trocar Persistence**
+  - PostgreSQL → MongoDB
+  - Implementar MongoOrderAdapter
+  - Implementa OrderRepositoryPort
+  - Core Domain não muda!
+  
+  **Exemplo 3: Trocar Notification**
+  - Email → SMS
+  - Implementar SmsAdapter
+  - Implementa NotificationServicePort
+  - Core Domain não muda!
+  
+  **Exemplo 4: Adicionar Primary Adapter**
+  - Adicionar CLI adapter
+  - Adicionar gRPC adapter
+  - Todos usam mesmo OrderServicePort
+  - Core Domain não muda!
+end note
+
+== Architecture Layers ==
+
+note over web_client, smtp
+  **Hexagonal Architecture Layers:**
+  
+  ```
+         ┌─────────────────────────────────┐
+         │   Primary Adapters (Driving)    │
+         │  REST, GraphQL, CLI, gRPC, etc  │
+         └────────────┬────────────────────┘
+                      │
+         ┌────────────▼────────────────────┐
+         │      Primary Ports (Input)      │
+         │  Interfaces: Use Cases/Services │
+         └────────────┬────────────────────┘
+                      │
+         ┌────────────▼────────────────────┐
+         │       CORE DOMAIN (HEX)         │
+         │  Business Logic, Entities,      │
+         │  Value Objects, Domain Services │
+         └────────────┬────────────────────┘
+                      │
+         ┌────────────▼────────────────────┐
+         │    Secondary Ports (Output)     │
+         │  Interfaces: Repos, Gateways    │
+         └────────────┬────────────────────┘
+                      │
+         ┌────────────▼────────────────────┐
+         │  Secondary Adapters (Driven)    │
+         │ JPA, HTTP Clients, SMTP, etc    │
+         └─────────────────────────────────┘
+  ```
+  
+  **Dependency Rule:**
+  - Setas sempre apontam PARA DENTRO
+  - Core não depende de Adapters
+  - Adapters dependem de Ports
+  - Ports pertencem ao Core
+  
+  **Benefits:**
+  - Testabilidade
+  - Flexibilidade
+  - Independência de frameworks
+  - Business logic protegida
+  - Facilita manutenção
+end note
+
+@enduml

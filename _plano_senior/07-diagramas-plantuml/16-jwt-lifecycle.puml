@@ -1,0 +1,758 @@
+@startuml JWT - JSON Web Token Lifecycle
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title JWT (JSON Web Token) - Creation, Validation & Lifecycle
+
+participant "Authentication\nService" as auth_service
+participant "JWT Library\n(jjwt/nimbus)" as jwt_lib
+database "Key Store\n(Private Key)" as key_store
+participant "Client\nApplication" as client
+participant "API Gateway" as api_gateway
+participant "Resource\nService" as resource_service
+database "Public Keys\n(JWKS Endpoint)" as jwks_endpoint
+participant "Token Blacklist\n(Redis)" as blacklist
+
+== JWT Structure Overview ==
+
+note over auth_service, jwt_lib
+  **JWT Structure: header.payload.signature**
+  
+  **1. Header (Base64URL encoded):**
+  ```json
+  {
+    "alg": "RS256",
+    "typ": "JWT",
+    "kid": "key-2025-11-15"
+  }
+  ```
+  
+  **2. Payload (Base64URL encoded):**
+  ```json
+  {
+    "sub": "user123",
+    "name": "John Doe",
+    "email": "john@example.com",
+    "roles": ["USER", "ADMIN"],
+    "iat": 1700000000,
+    "exp": 1700003600,
+    "iss": "https://auth.example.com",
+    "aud": "https://api.example.com"
+  }
+  ```
+  
+  **3. Signature:**
+  ```
+  RSASHA256(
+    base64UrlEncode(header) + "." +
+    base64UrlEncode(payload),
+    privateKey
+  )
+  ```
+  
+  **Complete JWT:**
+  ```
+  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImtleS0yMDI1LTExLTE1In0.eyJzdWIiOiJ1c2VyMTIzIiwibmFtZSI6IkpvaG4gRG9lIiwiZW1haWwiOiJqb2huQGV4YW1wbGUuY29tIiwicm9sZXMiOlsiVVNFUiIsIkFETUlOIl0sImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAzNjAwLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbSJ9.signature_here
+  ```
+  
+  **NOT Encrypted - Base64 is encoding, not encryption!**
+  Anyone can decode and read header + payload.
+  Signature proves authenticity and integrity.
+end note
+
+== 1. JWT Creation (Token Issuance) ==
+
+actor User as user
+
+user -> auth_service: POST /login\n{\n  "username": "john@example.com",\n  "password": "***"\n}
+activate user
+activate auth_service
+
+auth_service -> auth_service: Authenticate user:\n✓ Password valid\n✓ Account active\n✓ MFA passed (if required)
+
+note right of auth_service
+  **After Successful Authentication:**
+  
+  ```java
+  @Service
+  public class TokenService {
+    @Autowired
+    private JwtEncoder jwtEncoder;
+    
+    public String createToken(User user) {
+      Instant now = Instant.now();
+      Instant expiry = now.plus(1, ChronoUnit.HOURS);
+      
+      JwtClaimsSet claims = JwtClaimsSet.builder()
+        .issuer("https://auth.example.com")
+        .audience(List.of("https://api.example.com"))
+        .subject(user.getId())
+        .issuedAt(now)
+        .expiresAt(expiry)
+        .claim("name", user.getName())
+        .claim("email", user.getEmail())
+        .claim("roles", user.getRoles())
+        .claim("scope", "read write")
+        .build();
+      
+      return jwtEncoder.encode(
+        JwtEncoderParameters.from(claims)
+      ).getTokenValue();
+    }
+  }
+  ```
+end note
+
+auth_service -> jwt_lib: createToken(\n  claims: {\n    sub: "user123",\n    name: "John Doe",\n    email: "john@example.com",\n    roles: ["USER", "ADMIN"],\n    iat: 1700000000,\n    exp: 1700003600,\n    iss: "https://auth.example.com",\n    aud: "https://api.example.com"\n  }\n)
+activate jwt_lib
+
+note right of jwt_lib
+  **Standard Claims (RFC 7519):**
+  
+  **Registered Claims:**
+  - iss (issuer): Who issued the token
+  - sub (subject): User identifier
+  - aud (audience): Who can use the token
+  - exp (expiration): When token expires (Unix timestamp)
+  - nbf (not before): Token not valid before this time
+  - iat (issued at): When token was issued
+  - jti (JWT ID): Unique token identifier
+  
+  **Custom Claims:**
+  - name, email, roles: Application-specific
+  - Anything JSON serializable
+  - Keep payload small (transmitted in every request!)
+  
+  **Sensitive Data:**
+  ❌ DON'T include passwords, secrets, PII
+  ✅ DO include: user ID, roles, permissions
+end note
+
+jwt_lib -> jwt_lib: 1. Create Header:\n{\n  "alg": "RS256",\n  "typ": "JWT",\n  "kid": "key-2025-11-15"\n}
+
+jwt_lib -> jwt_lib: 2. Encode Header:\nbase64UrlEncode(header)\n= "eyJhbGc...JWT"
+
+jwt_lib -> jwt_lib: 3. Encode Payload:\nbase64UrlEncode(payload)\n= "eyJzdWI..."
+
+jwt_lib -> key_store: GET private_key\n(for signing)
+activate key_store
+
+note right of key_store
+  **Key Management:**
+  
+  **RSA (Asymmetric - Recommended):**
+  - Private key: Signs tokens (auth server only)
+  - Public key: Verifies tokens (all services)
+  - Key size: 2048-bit minimum, 4096-bit recommended
+  
+  **HMAC (Symmetric - Simpler):**
+  - Shared secret: Signs AND verifies
+  - All services need the secret
+  - Harder to distribute securely
+  
+  **Key Storage:**
+  - HSM (Hardware Security Module) - Production
+  - AWS KMS, Azure Key Vault, GCP KMS
+  - Encrypted files - Development
+  - Environment variables - Never!
+  
+  **Key Rotation:**
+  - Generate new keys periodically (90 days)
+  - Keep old keys for verification (grace period)
+  - kid (Key ID) header identifies which key
+end note
+
+key_store --> jwt_lib: PrivateKey\n(RSA 4096-bit)
+deactivate key_store
+
+jwt_lib -> jwt_lib: 4. Create Signature:\nRSASHA256(\n  "eyJhbGc...JWT" + "." + "eyJzdWI...",\n  privateKey\n)\n= "signature_bytes"
+
+jwt_lib -> jwt_lib: 5. Encode Signature:\nbase64UrlEncode(signature)\n= "Ab3cD..."
+
+jwt_lib -> jwt_lib: 6. Concatenate:\nheader + "." + payload + "." + signature
+
+jwt_lib --> auth_service: JWT Token:\neyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImtleS0yMDI1LTExLTE1In0.eyJzdWIiOiJ1c2VyMTIzIiwibmFtZSI6IkpvaG4gRG9lIiwiZW1haWwiOiJqb2huQGV4YW1wbGUuY29tIiwicm9sZXMiOlsiVVNFUiIsIkFETUlOIl0sImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAzNjAwLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbSJ9.Ab3cD...signature
+deactivate jwt_lib
+
+auth_service --> user: HTTP 200 OK\n{\n  "access_token": "eyJhbGc...signature",\n  "token_type": "Bearer",\n  "expires_in": 3600\n}
+deactivate auth_service
+
+user -> client: Store token
+deactivate user
+activate client
+
+note right of client
+  **Token Storage (Client-side):**
+  
+  **SPA (Single Page Application):**
+  - Memory: Most secure (lost on refresh)
+  - SessionStorage: Survives refresh, same tab only
+  - LocalStorage: ❌ Vulnerable to XSS
+  
+  **Mobile:**
+  - iOS Keychain
+  - Android Keystore
+  - Secure Enclave
+  
+  **Server-side:**
+  - HttpOnly cookie (CSRF protection needed)
+  - Session storage
+end note
+
+client -> client: token stored in memory
+
+== 2. JWT Validation (Resource Access) ==
+
+client -> api_gateway: GET /api/users/profile\nAuthorization: Bearer eyJhbGc...signature
+deactivate client
+activate api_gateway
+
+note right of api_gateway
+  **Authorization Header:**
+  
+  ```
+  Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImtleS0yMDI1LTExLTE1In0.eyJzdWIiOiJ1c2VyMTIzIiwibmFtZSI6IkpvaG4gRG9lIiwiZW1haWwiOiJqb2huQGV4YW1wbGUuY29tIiwicm9sZXMiOlsiVVNFUiIsIkFETUlOIl0sImlhdCI6MTcwMDAwMDAwMCwiZXhwIjoxNzAwMDAzNjAwLCJpc3MiOiJodHRwczovL2F1dGguZXhhbXBsZS5jb20iLCJhdWQiOiJodHRwczovL2FwaS5leGFtcGxlLmNvbSJ9.Ab3cD...signature
+  ```
+  
+  **Extract token:**
+  ```java
+  String authHeader = request.getHeader("Authorization");
+  if (authHeader != null && authHeader.startsWith("Bearer ")) {
+    String token = authHeader.substring(7);
+    // Validate token...
+  }
+  ```
+end note
+
+api_gateway -> api_gateway: Extract JWT\nfrom Authorization header
+
+api_gateway -> jwt_lib: validateToken(jwt)
+activate jwt_lib
+
+jwt_lib -> jwt_lib: 1. Split token:\nparts = jwt.split("\\.")\nheader = parts[0]\npayload = parts[1]\nsignature = parts[2]
+
+jwt_lib -> jwt_lib: 2. Decode header:\nheaderJson = base64UrlDecode(header)\n{\n  "alg": "RS256",\n  "typ": "JWT",\n  "kid": "key-2025-11-15"\n}
+
+jwt_lib -> jwt_lib: 3. Extract Key ID (kid):\nkid = "key-2025-11-15"
+
+jwt_lib -> jwks_endpoint: GET /.well-known/jwks.json\n(fetch public keys)
+activate jwks_endpoint
+
+note right of jwks_endpoint
+  **JWKS (JSON Web Key Set) Endpoint:**
+  
+  **URL:**
+  https://auth.example.com/.well-known/jwks.json
+  
+  **Response:**
+  ```json
+  {
+    "keys": [
+      {
+        "kty": "RSA",
+        "use": "sig",
+        "kid": "key-2025-11-15",
+        "n": "0vx7agoebG...modulus",
+        "e": "AQAB"
+      },
+      {
+        "kty": "RSA",
+        "use": "sig",
+        "kid": "key-2025-10-15",
+        "n": "xjlCRBqkn...old_modulus",
+        "e": "AQAB"
+      }
+    ]
+  }
+  ```
+  
+  **Caching:**
+  - Cache public keys (1-24 hours)
+  - Refresh periodically
+  - Retry on kid mismatch
+  
+  **Key Rotation:**
+  - Multiple keys in JWKS (current + old)
+  - Grace period for old tokens
+end note
+
+jwks_endpoint --> jwt_lib: {\n  "keys": [\n    {\n      "kid": "key-2025-11-15",\n      "kty": "RSA",\n      "use": "sig",\n      "n": "modulus...",\n      "e": "AQAB"\n    }\n  ]\n}
+deactivate jwks_endpoint
+
+jwt_lib -> jwt_lib: 4. Find public key:\nkey = keys.find(k => k.kid == "key-2025-11-15")\nPublicKey found ✅
+
+jwt_lib -> jwt_lib: 5. Verify Signature:\nexpectedSig = RSASHA256(\n  header + "." + payload,\n  publicKey\n)\nreceivedSig = base64UrlDecode(signature)\nexpectedSig == receivedSig? YES ✅
+
+note right of jwt_lib
+  **Signature Verification:**
+  
+  ```java
+  @Component
+  public class JwtValidator {
+    private final JwtDecoder jwtDecoder;
+    
+    public JwtValidator() {
+      // Fetch public keys from JWKS endpoint
+      this.jwtDecoder = NimbusJwtDecoder
+        .withJwkSetUri(
+          "https://auth.example.com/.well-known/jwks.json"
+        )
+        .build();
+    }
+    
+    public Jwt validate(String token) {
+      try {
+        // Validates signature, expiry, issuer, audience
+        Jwt jwt = jwtDecoder.decode(token);
+        return jwt;
+      } catch (JwtException e) {
+        throw new UnauthorizedException("Invalid token", e);
+      }
+    }
+  }
+  ```
+  
+  **What signature verification proves:**
+  - Token issued by trusted authority (has private key)
+  - Token not tampered with (signature matches)
+  - Token integrity (payload unchanged)
+end note
+
+jwt_lib -> jwt_lib: Signature valid ✅\nDecode payload
+
+jwt_lib -> jwt_lib: 6. Decode Payload:\npayloadJson = base64UrlDecode(payload)\n{\n  "sub": "user123",\n  "exp": 1700003600,\n  "iat": 1700000000,\n  "iss": "https://auth.example.com",\n  "aud": "https://api.example.com"\n}
+
+jwt_lib -> jwt_lib: 7. Validate Claims:\n✓ exp > now? (not expired)\n✓ nbf <= now? (not before)\n✓ iss == expected issuer?\n✓ aud contains this service?\n✓ iat <= now? (issued in past)
+
+note right of jwt_lib
+  **Claims Validation:**
+  
+  ```java
+  public void validateClaims(Jwt jwt) {
+    Instant now = Instant.now();
+    Instant expiry = jwt.getExpiresAt();
+    Instant issuedAt = jwt.getIssuedAt();
+    
+    // Check expiration
+    if (expiry != null && expiry.isBefore(now)) {
+      throw new JwtExpiredException("Token expired");
+    }
+    
+    // Check not before
+    Instant notBefore = jwt.getNotBefore();
+    if (notBefore != null && notBefore.isAfter(now)) {
+      throw new JwtNotYetValidException("Token not yet valid");
+    }
+    
+    // Check issuer
+    String issuer = jwt.getIssuer().toString();
+    if (!issuer.equals("https://auth.example.com")) {
+      throw new JwtInvalidIssuerException("Invalid issuer");
+    }
+    
+    // Check audience
+    List<String> audiences = jwt.getAudience();
+    if (!audiences.contains("https://api.example.com")) {
+      throw new JwtInvalidAudienceException("Invalid audience");
+    }
+  }
+  ```
+  
+  **Clock Skew:**
+  - Allow 1-2 minutes tolerance
+  - Account for server time differences
+end note
+
+jwt_lib -> jwt_lib: All validations passed ✅
+
+jwt_lib --> api_gateway: JWT Valid ✅\nClaims: {\n  sub: "user123",\n  roles: ["USER", "ADMIN"],\n  email: "john@example.com"\n}
+deactivate jwt_lib
+
+api_gateway -> api_gateway: Check authorization:\nroles contains "USER"? YES ✅\nEndpoint requires "USER" role ✅
+
+note right of api_gateway
+  **Authorization (RBAC):**
+  
+  ```java
+  @RestController
+  @RequestMapping("/api/users")
+  public class UserController {
+    
+    @GetMapping("/profile")
+    @PreAuthorize("hasRole('USER')")
+    public UserProfile getProfile(
+      @AuthenticationPrincipal Jwt jwt
+    ) {
+      String userId = jwt.getSubject();
+      return userService.getProfile(userId);
+    }
+    
+    @PostMapping("/admin/users")
+    @PreAuthorize("hasRole('ADMIN')")
+    public User createUser(@RequestBody User user) {
+      return userService.create(user);
+    }
+  }
+  ```
+  
+  **Extract User Context:**
+  ```java
+  String userId = jwt.getSubject();
+  String email = jwt.getClaim("email");
+  List<String> roles = jwt.getClaim("roles");
+  ```
+end note
+
+api_gateway -> resource_service: Forward request:\nGET /users/profile\nX-User-Id: user123\nX-User-Roles: USER,ADMIN\nX-User-Email: john@example.com
+activate resource_service
+
+note right of api_gateway
+  **Propagate User Context:**
+  
+  - Extract claims from JWT
+  - Pass as headers to downstream services
+  - Services don't need to validate JWT again
+  - Gateway handles authentication/authorization
+  
+  **Alternative:**
+  - Forward JWT to downstream services
+  - Each service validates independently
+  - More secure but slower
+end note
+
+resource_service -> resource_service: Process request\nwith user context
+
+resource_service --> api_gateway: HTTP 200 OK\n{\n  "id": "user123",\n  "name": "John Doe",\n  "email": "john@example.com"\n}
+deactivate resource_service
+
+api_gateway --> client: HTTP 200 OK\n{\n  "id": "user123",\n  "name": "John Doe",\n  "email": "john@example.com"\n}
+deactivate api_gateway
+activate client
+
+client --> user: Display profile
+deactivate client
+activate user
+deactivate user
+
+== 3. JWT Expiration Handling ==
+
+client -> api_gateway: GET /api/orders\nAuthorization: Bearer eyJhbGc...EXPIRED
+activate client
+activate api_gateway
+
+api_gateway -> jwt_lib: validateToken(expiredJwt)
+activate jwt_lib
+
+jwt_lib -> jwt_lib: Decode payload:\nexp = 1700003600\nnow = 1700010000\nExpired! ❌
+
+jwt_lib --> api_gateway: throw JwtExpiredException(\n  "Token expired at 1700003600"\n)
+deactivate jwt_lib
+
+api_gateway --> client: HTTP 401 Unauthorized\n{\n  "error": "token_expired",\n  "error_description": "JWT expired",\n  "expired_at": "2025-11-15T11:30:00Z"\n}
+deactivate api_gateway
+
+note right of client
+  **Token Expiration:**
+  
+  - JWT cannot be "renewed" (immutable)
+  - Client must obtain new token
+  - Use refresh token (OAuth 2.0)
+  - Or re-authenticate
+  
+  **Typical Expiry Times:**
+  - Access token: 15-60 minutes
+  - ID token: 1 hour
+  - Refresh token: days/months (not JWT)
+end note
+
+client -> auth_service: POST /token\ngrant_type=refresh_token\nrefresh_token=...
+activate auth_service
+
+auth_service --> client: New JWT with extended expiry
+deactivate auth_service
+
+client -> api_gateway: Retry with new token
+deactivate client
+activate api_gateway
+
+api_gateway --> client: HTTP 200 OK
+deactivate api_gateway
+
+== 4. JWT Revocation (Logout) ==
+
+user -> client: Click "Logout"
+activate user
+deactivate user
+activate client
+
+client -> auth_service: POST /logout\nAuthorization: Bearer eyJhbGc...signature
+activate auth_service
+
+note right of auth_service
+  **JWT Revocation Challenge:**
+  
+  - JWTs are stateless (no server-side session)
+  - Cannot "delete" a JWT
+  - Valid until expiry
+  
+  **Solutions:**
+  
+  **1. Token Blacklist (this example):**
+  - Add token ID (jti claim) to blacklist
+  - Check blacklist on every request
+  - TTL = remaining token lifetime
+  - Requires distributed cache (Redis)
+  
+  **2. Short TTL + No Blacklist:**
+  - 5-15 minute expiry
+  - Accept logout delay
+  - Simpler, no blacklist overhead
+  
+  **3. Revocation Events:**
+  - Publish "token revoked" event
+  - Services subscribe and cache blacklist
+  - Eventual consistency
+  
+  **4. Refresh Token Revocation:**
+  - Revoke refresh token only
+  - Access token expires soon anyway
+  - Most common approach
+end note
+
+auth_service -> jwt_lib: extractTokenId(jwt)
+activate jwt_lib
+
+jwt_lib -> jwt_lib: Decode payload:\njti = "token-unique-id-123"
+
+jwt_lib --> auth_service: jti: "token-unique-id-123"
+deactivate jwt_lib
+
+auth_service -> auth_service: Calculate TTL:\nexp = jwt.exp\nnow = current time\nttl = exp - now\n= 600 seconds (10 min)
+
+auth_service -> blacklist: SETEX blacklist:token-unique-id-123\n  "revoked"\n  600 seconds
+activate blacklist
+
+note right of blacklist
+  **Blacklist Storage (Redis):**
+  
+  ```redis
+  SETEX blacklist:token-unique-id-123 600 "revoked"
+  ```
+  
+  **Key:** blacklist:{jti}
+  **Value:** "revoked" or metadata
+  **TTL:** Remaining token lifetime
+  
+  **On validation:**
+  ```java
+  String jti = jwt.getClaim("jti");
+  if (redisTemplate.hasKey("blacklist:" + jti)) {
+    throw new JwtRevokedException("Token revoked");
+  }
+  ```
+  
+  **Memory Considerations:**
+  - Each token uses ~100 bytes
+  - 1M active tokens = ~100 MB
+  - Auto-cleanup via Redis TTL
+end note
+
+blacklist --> auth_service: Token blacklisted
+deactivate blacklist
+
+auth_service --> client: HTTP 200 OK\n{\n  "message": "Logged out successfully"\n}
+deactivate auth_service
+
+client -> client: Clear stored token
+
+client --> user: Logged out
+deactivate client
+activate user
+
+== 5. Blacklist Check (Subsequent Request) ==
+
+user -> client: GET /api/data
+deactivate user
+activate client
+
+client -> api_gateway: GET /api/data\nAuthorization: Bearer eyJhbGc...\n(revoked token)
+deactivate client
+activate api_gateway
+
+api_gateway -> jwt_lib: validateToken(jwt)
+activate jwt_lib
+
+jwt_lib -> jwt_lib: Signature valid ✅\nClaims valid ✅\nNot expired ✅
+
+jwt_lib --> api_gateway: JWT structurally valid
+deactivate jwt_lib
+
+api_gateway -> jwt_lib: extractTokenId(jwt)
+activate jwt_lib
+
+jwt_lib --> api_gateway: jti: "token-unique-id-123"
+deactivate jwt_lib
+
+api_gateway -> blacklist: EXISTS blacklist:token-unique-id-123
+activate blacklist
+
+blacklist --> api_gateway: YES (token in blacklist)
+deactivate blacklist
+
+note right of api_gateway
+  **Blacklist Check:**
+  
+  ```java
+  @Component
+  public class JwtBlacklistValidator {
+    @Autowired
+    private RedisTemplate<String, String> redis;
+    
+    public void checkBlacklist(Jwt jwt) {
+      String jti = jwt.getClaim("jti");
+      
+      if (jti != null && 
+          redis.hasKey("blacklist:" + jti)) {
+        throw new JwtRevokedException(
+          "Token has been revoked"
+        );
+      }
+    }
+  }
+  ```
+  
+  **Performance Impact:**
+  - Redis GET: ~1ms
+  - Adds latency to every request
+  - Alternative: Skip blacklist, use short TTL
+end note
+
+api_gateway --> client: HTTP 401 Unauthorized\n{\n  "error": "token_revoked",\n  "error_description": "Token has been revoked"\n}
+deactivate api_gateway
+activate client
+
+client -> client: Token revoked!\nClear token, redirect to login
+
+client --> user: Please login again
+deactivate client
+activate user
+deactivate user
+
+== JWT vs JWE vs Session Tokens ==
+
+note over auth_service, blacklist
+  **JWT (JSON Web Token):**
+  
+  ✅ **Benefits:**
+  - Stateless (no server-side storage)
+  - Scalable (no session lookup)
+  - Cross-domain (CORS-friendly)
+  - Self-contained (claims in token)
+  - Standard (RFC 7519)
+  
+  ⚠️ **Drawbacks:**
+  - Cannot revoke (without blacklist)
+  - Larger size (sent in every request)
+  - Cannot change claims (must reissue)
+  - Exposed to XSS if stored improperly
+  
+  **Session Tokens (Opaque):**
+  
+  ✅ **Benefits:**
+  - Easy revocation (delete from DB)
+  - Small size (random string)
+  - Server controls everything
+  
+  ⚠️ **Drawbacks:**
+  - Requires server-side storage
+  - Session lookup on every request
+  - Harder to scale horizontally
+  - Sticky sessions or shared session store
+  
+  **When to use JWT:**
+  - Microservices architecture
+  - Stateless APIs
+  - Mobile apps
+  - Third-party integrations
+  - Short-lived tokens
+  
+  **When to use Session Tokens:**
+  - Monolithic apps
+  - Need immediate revocation
+  - Long-lived sessions
+  - High-security requirements
+  
+  **Hybrid Approach:**
+  - Refresh token: Opaque (in DB, revocable)
+  - Access token: JWT (stateless, short-lived)
+  - Best of both worlds!
+end note
+
+== Security Best Practices ==
+
+note over auth_service, blacklist
+  **JWT Security Checklist:**
+  
+  ✅ **Algorithm:**
+  - Use RS256 (RSA) or ES256 (ECDSA)
+  - Avoid HS256 (symmetric) in public APIs
+  - Never use "none" algorithm
+  
+  ✅ **Claims:**
+  - Always include exp (expiration)
+  - Include iss (issuer) and aud (audience)
+  - Use jti (JWT ID) for revocation
+  - Don't include sensitive data (passwords, SSNs)
+  
+  ✅ **Key Management:**
+  - Use strong keys (RSA 2048+, ECDSA 256+)
+  - Store private keys securely (HSM, KMS)
+  - Rotate keys regularly (90 days)
+  - Support multiple keys simultaneously (kid)
+  
+  ✅ **Validation:**
+  - Verify signature (always!)
+  - Check expiration (exp claim)
+  - Validate issuer (iss claim)
+  - Validate audience (aud claim)
+  - Check not before (nbf claim)
+  - Use allowlist for algorithms
+  
+  ✅ **Storage:**
+  - Memory (best for SPA)
+  - HttpOnly cookie (with SameSite)
+  - Secure storage (mobile)
+  - Never localStorage (XSS vulnerable!)
+  
+  ✅ **Transmission:**
+  - HTTPS only
+  - Authorization header (not URL params)
+  - Bearer scheme
+  
+  ⚠️ **Common Attacks:**
+  
+  **None Algorithm:**
+  - Attacker sets "alg": "none"
+  - Server skips signature verification
+  - Mitigation: Allowlist algorithms, reject "none"
+  
+  **Algorithm Confusion:**
+  - Attacker changes RS256 to HS256
+  - Uses public key as HMAC secret
+  - Mitigation: Strict algorithm checking
+  
+  **Token Theft:**
+  - XSS, MITM, logs, error messages
+  - Mitigation: Secure storage, HTTPS, short TTL
+  
+  **Replay Attacks:**
+  - Attacker reuses stolen token
+  - Mitigation: Short expiry, jti + nonce
+  
+  **Key Confusion:**
+  - Wrong key used for verification
+  - Mitigation: kid header, JWKS endpoint
+end note
+
+@enduml

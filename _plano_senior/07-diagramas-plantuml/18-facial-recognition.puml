@@ -1,0 +1,896 @@
+@startuml Facial Recognition Authentication
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Facial Recognition Authentication (OpenCV + face_recognition + DeepFace)
+
+actor "User" as user
+participant "Mobile App\n(React Native)" as mobile_app
+participant "Camera\nService" as camera
+participant "API Gateway" as api_gateway
+participant "Face Recognition\nService" as face_service
+participant "OpenCV\nPreprocessing" as opencv
+participant "face_recognition\n(dlib)" as face_recognition_lib
+participant "DeepFace\n(FaceNet/VGG)" as deepface
+database "Face Embeddings\nDB (PostgreSQL)" as embeddings_db
+database "User DB" as user_db
+database "Audit Log" as audit_log
+participant "Liveness\nDetection" as liveness
+participant "Anti-Spoofing\nModel" as anti_spoofing
+
+== System Architecture ==
+
+note over mobile_app, anti_spoofing
+  **Open Source Stack:**
+  
+  **Image Capture:**
+  - React Native Camera / Expo Camera
+  - Native camera APIs (iOS/Android)
+  
+  **Preprocessing:**
+  - OpenCV 4.x (cv2)
+  - Face detection, alignment, normalization
+  
+  **Face Recognition:**
+  - face_recognition (dlib-based, Python)
+    * 68-point facial landmarks
+    * 128-dimensional embeddings
+    * Accuracy: ~99.38% on LFW dataset
+  
+  - DeepFace (Facebook Research)
+    * Multiple models: VGG-Face, FaceNet, ArcFace
+    * Deep learning-based embeddings
+    * State-of-the-art accuracy
+  
+  **Liveness Detection:**
+  - Eye blink detection (dlib EAR - Eye Aspect Ratio)
+  - Head movement tracking
+  - Texture analysis (LBP - Local Binary Patterns)
+  - Challenge-response (smile, turn head)
+  
+  **Anti-Spoofing:**
+  - Silent-Face-Anti-Spoofing (open source)
+  - Detects photos, videos, 3D masks
+  - MiniFASNet model
+  
+  **Storage:**
+  - PostgreSQL with pgvector extension
+  - Vector similarity search (cosine distance)
+  - Encrypted face embeddings (AES-256)
+end note
+
+== 1. User Registration (Enrollment) ==
+
+user -> mobile_app: Tap "Register with Face"
+activate user
+activate mobile_app
+
+mobile_app --> user: Request camera permission
+deactivate mobile_app
+
+user -> mobile_app: Grant camera access
+activate mobile_app
+
+mobile_app -> camera: Initialize camera\nfront-facing\nresolution: 1080p\nfps: 30
+activate camera
+
+camera --> mobile_app: Camera ready\nShow preview
+deactivate camera
+
+mobile_app --> user: Show face registration screen:\n"Position your face in the circle\nLook straight at camera"
+deactivate mobile_app
+
+note right of user
+  **Registration Requirements:**
+  
+  - Multiple photos (3-5 angles)
+  - Different expressions (neutral, smile)
+  - Different lighting conditions
+  - Remove glasses/hat if possible
+  - Good lighting (not backlit)
+  - Distance: 30-50cm from camera
+  
+  **Quality Checks:**
+  - Face detection confidence > 95%
+  - Face size: 80x80 pixels minimum
+  - Face not blurred (Laplacian variance)
+  - Face centered in frame
+  - Eyes open and visible
+end note
+
+user -> camera: Position face\nLook at camera
+activate camera
+
+camera -> mobile_app: Capture frame\n(1920x1080 RGB)
+deactivate camera
+activate mobile_app
+
+mobile_app -> api_gateway: POST /api/face/register/capture\nContent-Type: multipart/form-data\nimage: base64(image_data)\nuser_id: "user123"
+deactivate mobile_app
+activate api_gateway
+
+api_gateway -> face_service: Forward registration request
+deactivate api_gateway
+activate face_service
+
+note right of face_service
+  **Face Recognition Service (Python/FastAPI):**
+  
+  ```python
+  from fastapi import FastAPI, File, UploadFile
+  import face_recognition
+  import cv2
+  import numpy as np
+  from deepface import DeepFace
+  
+  app = FastAPI()
+  
+  @app.post("/api/face/register/capture")
+  async def register_face(
+    user_id: str,
+    image: UploadFile
+  ):
+    # Read image
+    image_data = await image.read()
+    nparr = np.frombuffer(image_data, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    # Preprocess
+    img = preprocess_image(img)
+    
+    # Detect face
+    faces = face_recognition.face_locations(img)
+    
+    if len(faces) == 0:
+      raise HTTPException(400, "No face detected")
+    
+    if len(faces) > 1:
+      raise HTTPException(400, "Multiple faces detected")
+    
+    # Extract embedding
+    embedding = face_recognition.face_encodings(img, faces)[0]
+    
+    # Store embedding
+    store_face_embedding(user_id, embedding)
+    
+    return {"status": "success", "face_count": 1}
+  ```
+end note
+
+face_service -> opencv: preprocessImage(rawImage)
+activate opencv
+
+opencv -> opencv: 1. Convert to RGB:\nimg_rgb = cv2.cvtColor(\n  img, cv2.COLOR_BGR2RGB\n)
+
+opencv -> opencv: 2. Detect face:\nface_cascade = cv2.CascadeClassifier(\n  'haarcascade_frontalface_default.xml'\n)\nfaces = face_cascade.detectMultiScale(\n  img_rgb, \n  scaleFactor=1.1,\n  minNeighbors=5,\n  minSize=(80, 80)\n)
+
+note right of opencv
+  **OpenCV Face Detection:**
+  
+  ```python
+  import cv2
+  
+  # Load Haar Cascade classifier
+  face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 
+    'haarcascade_frontalface_default.xml'
+  )
+  
+  # Detect faces
+  faces = face_cascade.detectMultiScale(
+    gray_img,
+    scaleFactor=1.1,  # Image pyramid scale
+    minNeighbors=5,   # Min detections for accept
+    minSize=(80, 80), # Minimum face size
+    flags=cv2.CASCADE_SCALE_IMAGE
+  )
+  
+  # Result: [(x, y, w, h), ...]
+  # x, y: top-left corner
+  # w, h: width, height of face bounding box
+  ```
+  
+  **Alternative: DNN-based detection (more accurate):**
+  ```python
+  # Load pre-trained model
+  net = cv2.dnn.readNetFromCaffe(
+    'deploy.prototxt',
+    'res10_300x300_ssd_iter_140000.caffemodel'
+  )
+  
+  blob = cv2.dnn.blobFromImage(
+    img, 1.0, (300, 300), (104, 117, 123)
+  )
+  net.setInput(blob)
+  detections = net.forward()
+  ```
+end note
+
+opencv -> opencv: face_count = 1 ✅\nExtract face region:\n(x, y, w, h) = faces[0]\nface_img = img[y:y+h, x:x+w]
+
+opencv -> opencv: 3. Check image quality:\nblur_score = cv2.Laplacian(\n  face_img, cv2.CV_64F\n).var()\nblur_score > 100? YES ✅
+
+note right of opencv
+  **Blur Detection (Laplacian Variance):**
+  
+  ```python
+  def is_blurry(image, threshold=100):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    
+    # Lower variance = more blur
+    # threshold 100: typical cutoff
+    return laplacian_var < threshold
+  
+  # Check
+  if is_blurry(face_img):
+    raise ValueError("Image too blurry")
+  ```
+  
+  **Alternative: Fast Fourier Transform (FFT):**
+  - Analyze frequency domain
+  - Blurred images lack high frequencies
+end note
+
+opencv -> opencv: 4. Align face:\nlandmarks = detect_landmarks(face_img)\neye_center = landmarks['left_eye']\naligned = rotate_to_align_eyes(\n  face_img, eye_center\n)
+
+opencv -> opencv: 5. Normalize:\n- Histogram equalization (contrast)\n- Resize to 160x160\n- Scale pixels to [0, 1]
+
+opencv --> face_service: Preprocessed image:\n160x160 RGB\nface detected ✅\naligned ✅\nquality good ✅
+deactivate opencv
+
+face_service -> face_recognition_lib: Extract face encoding:\nencoding = face_recognition.face_encodings(\n  preprocessed_img\n)[0]
+activate face_recognition_lib
+
+note right of face_recognition_lib
+  **face_recognition Library (dlib-based):**
+  
+  ```python
+  import face_recognition
+  
+  # Load image
+  image = face_recognition.load_image_file("person.jpg")
+  
+  # Find face locations (bounding boxes)
+  face_locations = face_recognition.face_locations(image)
+  # Result: [(top, right, bottom, left), ...]
+  
+  # Extract 128-dimensional embeddings
+  face_encodings = face_recognition.face_encodings(
+    image, 
+    face_locations
+  )
+  # Result: [numpy array of 128 floats, ...]
+  
+  # Each encoding is a point in 128-D space
+  # Similar faces have similar encodings
+  # Distance metric: Euclidean distance
+  ```
+  
+  **How it works:**
+  1. Detect 68 facial landmarks (dlib)
+  2. Normalize face pose/rotation
+  3. Pass through ResNet (trained on 3M faces)
+  4. Output: 128-D embedding vector
+  5. Embeddings capture facial features
+  
+  **Accuracy:**
+  - 99.38% on LFW (Labeled Faces in the Wild)
+  - Threshold: 0.6 (Euclidean distance)
+  - < 0.6: Same person
+  - > 0.6: Different person
+end note
+
+face_recognition_lib -> face_recognition_lib: 1. Detect 68 landmarks:\n- Jaw line (0-16)\n- Eyebrows (17-26)\n- Nose (27-35)\n- Eyes (36-47)\n- Mouth (48-67)
+
+face_recognition_lib -> face_recognition_lib: 2. Align face:\nRotate to canonical pose\n(eyes horizontal)
+
+face_recognition_lib -> face_recognition_lib: 3. Pass through ResNet:\nInput: 150x150 face\nOutput: 128-D embedding\n[0.023, -0.145, 0.678, ...]
+
+face_recognition_lib --> face_service: Face encoding:\n128-D vector\n[0.023, -0.145, 0.678, ..., 0.892]
+deactivate face_recognition_lib
+
+face_service -> deepface: Extract DeepFace embedding:\nembedding = DeepFace.represent(\n  img_path=preprocessed_img,\n  model_name='Facenet'\n)[0]['embedding']
+activate deepface
+
+note right of deepface
+  **DeepFace Library (Facebook Research):**
+  
+  ```python
+  from deepface import DeepFace
+  
+  # Extract embedding (multiple models available)
+  result = DeepFace.represent(
+    img_path="person.jpg",
+    model_name="Facenet",  # or VGG-Face, ArcFace, etc.
+    enforce_detection=True,
+    detector_backend="retinaface"
+  )
+  
+  embedding = result[0]['embedding']
+  # Facenet: 128-D
+  # VGG-Face: 2622-D
+  # ArcFace: 512-D
+  
+  # Compare faces
+  distance = DeepFace.verify(
+    img1_path="person1.jpg",
+    img2_path="person2.jpg",
+    model_name="Facenet",
+    distance_metric="cosine"
+  )
+  ```
+  
+  **Available Models:**
+  - **VGG-Face**: 2622-D, accurate but slow
+  - **Facenet**: 128-D, fast, Google
+  - **Facenet512**: 512-D, more accurate
+  - **OpenFace**: 128-D, lightweight
+  - **ArcFace**: 512-D, SOTA accuracy
+  - **DeepFace**: 4096-D, Facebook
+  
+  **Distance Metrics:**
+  - Cosine: Angle between vectors
+  - Euclidean: L2 distance
+  - L1: Manhattan distance
+end note
+
+deepface -> deepface: 1. Detect face:\nRetinaFace detector\n(more accurate than Haar Cascade)
+
+deepface -> deepface: 2. Align face:\n5-point alignment\n(eyes, nose, mouth corners)
+
+deepface -> deepface: 3. Pass through FaceNet:\nInception-ResNet architecture\nTriplet loss training\nOutput: 128-D embedding
+
+deepface --> face_service: DeepFace embedding:\n128-D vector\n[0.456, -0.789, 0.123, ..., 0.234]
+deactivate deepface
+
+note right of face_service
+  **Why Use Both Libraries?**
+  
+  - face_recognition: Fast, simple, good baseline
+  - DeepFace: More accurate, state-of-the-art models
+  - Ensemble: Average or concatenate embeddings
+  - Redundancy: If one fails, use other
+  
+  **Storage:**
+  - Store both embeddings
+  - Compare both during authentication
+  - Require both to match (AND logic)
+  - Or use voting (2 out of 3)
+end note
+
+face_service -> embeddings_db: INSERT INTO face_embeddings\n(user_id, embedding_face_recognition,\n embedding_deepface, created_at)\nVALUES\n('user123',\n '[0.023, -0.145, ...]',\n '[0.456, -0.789, ...]',\n NOW())
+activate embeddings_db
+
+note right of embeddings_db
+  **Face Embeddings Storage (PostgreSQL + pgvector):**
+  
+  ```sql
+  CREATE EXTENSION vector;
+  
+  CREATE TABLE face_embeddings (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(255) UNIQUE NOT NULL,
+    embedding_face_recognition VECTOR(128),
+    embedding_deepface VECTOR(128),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    
+    -- Encryption (AES-256)
+    encrypted_embedding BYTEA,
+    encryption_key_id VARCHAR(255)
+  );
+  
+  -- Index for fast similarity search
+  CREATE INDEX idx_face_recognition_embedding 
+  ON face_embeddings 
+  USING ivfflat (embedding_face_recognition vector_cosine_ops)
+  WITH (lists = 100);
+  
+  CREATE INDEX idx_deepface_embedding 
+  ON face_embeddings 
+  USING ivfflat (embedding_deepface vector_cosine_ops)
+  WITH (lists = 100);
+  ```
+  
+  **Vector Search (Cosine Similarity):**
+  ```sql
+  -- Find most similar face
+  SELECT user_id, 
+         1 - (embedding_face_recognition <=> '[0.023, -0.145, ...]') AS similarity
+  FROM face_embeddings
+  ORDER BY embedding_face_recognition <=> '[0.023, -0.145, ...]'
+  LIMIT 1;
+  ```
+  
+  **Security:**
+  - Encrypt embeddings at rest (AES-256)
+  - Biometric data = sensitive PII
+  - GDPR/CCPA compliance
+  - User consent required
+end note
+
+embeddings_db --> face_service: Embedding stored\nuser_id: user123
+deactivate embeddings_db
+
+face_service -> audit_log: Log registration:\n{\n  "event": "face_registration",\n  "user_id": "user123",\n  "timestamp": "2025-11-15T10:30:00Z",\n  "ip": "192.168.1.100"\n}
+activate audit_log
+
+audit_log --> face_service: Logged
+deactivate audit_log
+
+face_service --> api_gateway: HTTP 201 Created\n{\n  "status": "success",\n  "message": "Face registered",\n  "face_id": "face_abc123"\n}
+deactivate face_service
+activate api_gateway
+
+api_gateway --> mobile_app: Registration successful
+deactivate api_gateway
+activate mobile_app
+
+mobile_app --> user: ✅ Face registered!\nYou can now login with your face
+deactivate mobile_app
+deactivate user
+
+== 2. Authentication (Face Login) ==
+
+user -> mobile_app: Tap "Login with Face"
+activate user
+activate mobile_app
+
+mobile_app -> camera: Initialize camera
+activate camera
+
+camera --> mobile_app: Camera ready
+deactivate camera
+
+mobile_app --> user: "Look at the camera"
+deactivate mobile_app
+
+== 3. Liveness Detection (Anti-Spoofing) ==
+
+note right of user
+  **Liveness Detection:**
+  
+  Prevents spoofing attacks:
+  - Photo attacks (printed photo)
+  - Video replay attacks (video on phone)
+  - 3D mask attacks (3D-printed face)
+  
+  **Techniques:**
+  1. Challenge-response (blink, smile, turn head)
+  2. Texture analysis (LBP, BSIF)
+  3. Motion analysis (optical flow)
+  4. Depth sensing (stereo cameras)
+  5. Deep learning (CNNs trained on real/fake)
+end note
+
+mobile_app -> liveness: Start liveness check
+activate mobile_app
+activate liveness
+
+liveness --> mobile_app: "Please blink"
+deactivate liveness
+
+user -> camera: Blink eyes
+activate camera
+
+camera -> mobile_app: Capture video frames (2 seconds)
+deactivate camera
+
+mobile_app -> liveness: Analyze frames for blink
+activate liveness
+
+liveness -> liveness: Detect facial landmarks:\nEye Aspect Ratio (EAR)\nEAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)\nEAR < 0.2 → Eye closed\nEAR > 0.25 → Eye open
+
+note right of liveness
+  **Eye Blink Detection (EAR - Eye Aspect Ratio):**
+  
+  ```python
+  import dlib
+  from scipy.spatial import distance as dist
+  
+  def eye_aspect_ratio(eye_landmarks):
+    # Vertical distances
+    A = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
+    B = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
+    
+    # Horizontal distance
+    C = dist.euclidean(eye_landmarks[0], eye_landmarks[3])
+    
+    # EAR formula
+    ear = (A + B) / (2.0 * C)
+    return ear
+  
+  # Detect blink
+  detector = dlib.get_frontal_face_detector()
+  predictor = dlib.shape_predictor(
+    "shape_predictor_68_face_landmarks.dat"
+  )
+  
+  while True:
+    ret, frame = video.read()
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = detector(gray)
+    
+    for face in faces:
+      landmarks = predictor(gray, face)
+      left_eye = landmarks[36:42]
+      right_eye = landmarks[42:48]
+      
+      left_ear = eye_aspect_ratio(left_eye)
+      right_ear = eye_aspect_ratio(right_eye)
+      ear = (left_ear + right_ear) / 2.0
+      
+      if ear < 0.2:
+        blink_detected = True
+  ```
+  
+  **Blink Requirements:**
+  - EAR drops below 0.2
+  - Stays low for 2-3 frames
+  - Returns above 0.25
+  - Duration: 100-400ms
+end note
+
+liveness -> liveness: Blink detected ✅\nEAR: 0.28 → 0.18 → 0.27
+
+liveness --> mobile_app: "Please turn your head left"
+deactivate liveness
+
+user -> camera: Turn head left
+activate camera
+
+camera -> mobile_app: Capture frames
+deactivate camera
+
+mobile_app -> liveness: Analyze head movement
+activate liveness
+
+liveness -> liveness: Track face pose:\nYaw angle (left/right rotation)\nPitch angle (up/down)\nRoll angle (tilt)\n\nYaw: 0° → -25° → 0°\nMovement detected ✅
+
+liveness --> mobile_app: Liveness confirmed ✅\nReal human detected
+deactivate liveness
+
+mobile_app -> anti_spoofing: Check for spoofing\n(photo/video attack)
+activate anti_spoofing
+
+note right of anti_spoofing
+  **Silent-Face-Anti-Spoofing (Open Source):**
+  
+  ```python
+  from silent_face_anti_spoofing import AntiSpoofing
+  
+  # Load pre-trained model
+  model = AntiSpoofing()
+  
+  # Predict
+  result = model.predict(frame)
+  
+  # Result:
+  # {
+  #   "label": 1,  # 1=real, 0=fake
+  #   "score": 0.98,  # confidence
+  #   "type": "real"  # or "photo", "video", "mask"
+  # }
+  
+  if result["label"] == 1 and result["score"] > 0.9:
+    print("Real face")
+  else:
+    print(f"Spoofing detected: {result['type']}")
+  ```
+  
+  **MiniFASNet Model:**
+  - Lightweight CNN (1.1M parameters)
+  - Input: 80x80 RGB face crop
+  - Output: Real vs Fake probability
+  - Trained on CASIA-FASD, Replay-Attack datasets
+  
+  **Features Detected:**
+  - Texture patterns (moiré, printing artifacts)
+  - Depth cues (flat vs 3D)
+  - Motion inconsistencies
+  - Reflectance properties
+  - Screen borders (video replay)
+end note
+
+anti_spoofing -> anti_spoofing: Analyze texture:\nLocal Binary Patterns (LBP)\nReal skin has organic patterns\nPhotos have printing artifacts
+
+anti_spoofing -> anti_spoofing: Check depth:\nMonocular depth estimation\nReal faces have 3D structure\nPhotos are flat
+
+anti_spoofing -> anti_spoofing: MiniFASNet prediction:\nlabel: 1 (real)\nscore: 0.97\nconfidence: 97%
+
+anti_spoofing --> mobile_app: Real face confirmed ✅\nNo spoofing detected\nscore: 0.97
+deactivate anti_spoofing
+deactivate mobile_app
+
+== 4. Face Recognition & Authentication ==
+
+camera -> mobile_app: Capture authentication photo
+activate camera
+activate mobile_app
+
+camera --> mobile_app: High-quality image
+deactivate camera
+
+mobile_app -> api_gateway: POST /api/face/authenticate\nimage: base64(image_data)
+deactivate mobile_app
+activate api_gateway
+
+api_gateway -> face_service: Forward authentication request
+deactivate api_gateway
+activate face_service
+
+face_service -> opencv: Preprocess image\n(same pipeline as registration)
+activate opencv
+
+opencv --> face_service: Preprocessed image\n160x160 RGB
+deactivate opencv
+
+face_service -> face_recognition_lib: Extract encoding
+activate face_recognition_lib
+
+face_recognition_lib --> face_service: Encoding: [0.025, -0.143, ...]
+deactivate face_recognition_lib
+
+face_service -> deepface: Extract DeepFace embedding
+activate deepface
+
+deepface --> face_service: Embedding: [0.459, -0.785, ...]
+deactivate deepface
+
+face_service -> embeddings_db: SELECT user_id,\n  embedding_face_recognition,\n  embedding_deepface,\n  1 - (embedding_face_recognition <=> '[0.025, ...]') AS similarity_fr,\n  1 - (embedding_deepface <=> '[0.459, ...]') AS similarity_df\nFROM face_embeddings\nORDER BY similarity_fr DESC\nLIMIT 5
+activate embeddings_db
+
+note right of embeddings_db
+  **Vector Similarity Search:**
+  
+  ```sql
+  -- Cosine similarity search
+  SELECT 
+    user_id,
+    1 - (embedding_face_recognition <=> $1) AS similarity
+  FROM face_embeddings
+  WHERE 1 - (embedding_face_recognition <=> $1) > 0.4
+  ORDER BY embedding_face_recognition <=> $1
+  LIMIT 5;
+  ```
+  
+  **Distance Metrics:**
+  - Cosine distance: `<=>` (0 = identical, 2 = opposite)
+  - L2 distance: `<->` (Euclidean)
+  - Inner product: `<#>` (dot product)
+  
+  **Similarity:**
+  - Cosine similarity = 1 - cosine_distance
+  - Range: [0, 1]
+  - 1.0 = identical
+  - 0.9+ = very similar (same person)
+  - 0.6-0.9 = similar (possibly same)
+  - < 0.6 = different person
+end note
+
+embeddings_db --> face_service: Top matches:\n[\n  {\n    "user_id": "user123",\n    "similarity_fr": 0.94,\n    "similarity_df": 0.92\n  },\n  {\n    "user_id": "user456",\n    "similarity_fr": 0.67,\n    "similarity_df": 0.65\n  }\n]
+deactivate embeddings_db
+
+face_service -> face_service: Compare similarities:\nBest match: user123\nface_recognition similarity: 0.94\nDeepFace similarity: 0.92\n\nThreshold: 0.6 (face_recognition)\nThreshold: 0.7 (DeepFace)\n\nBoth above threshold ✅\nSame person confirmed!
+
+note right of face_service
+  **Matching Logic:**
+  
+  ```python
+  def authenticate_face(probe_embedding_fr, probe_embedding_df):
+    # Find top matches
+    matches = search_similar_faces(
+      probe_embedding_fr, 
+      probe_embedding_df,
+      limit=5
+    )
+    
+    # Thresholds (tune based on FAR/FRR)
+    FR_THRESHOLD = 0.6  # face_recognition
+    DF_THRESHOLD = 0.7  # DeepFace
+    
+    for match in matches:
+      similarity_fr = match['similarity_fr']
+      similarity_df = match['similarity_df']
+      
+      # Both must exceed threshold (AND logic)
+      if (similarity_fr > FR_THRESHOLD and 
+          similarity_df > DF_THRESHOLD):
+        return {
+          'authenticated': True,
+          'user_id': match['user_id'],
+          'confidence': (similarity_fr + similarity_df) / 2
+        }
+    
+    return {'authenticated': False}
+  ```
+  
+  **False Accept Rate (FAR) vs False Reject Rate (FRR):**
+  
+  Threshold | FAR     | FRR
+  ----------|---------|--------
+  0.4       | 1.0%    | 0.1%
+  0.5       | 0.5%    | 0.5%
+  0.6       | 0.1%    | 1.0%  ← Balanced
+  0.7       | 0.01%   | 5.0%
+  
+  **Choose threshold based on security needs:**
+  - High security (banking): 0.7+ (low FAR, high FRR)
+  - Convenience (phone unlock): 0.5-0.6 (balanced)
+end note
+
+face_service -> user_db: SELECT * FROM users\nWHERE id = 'user123'
+activate user_db
+
+user_db --> face_service: User:\nname: "John Doe"\nemail: "john@example.com"\nactive: true
+deactivate user_db
+
+face_service -> face_service: Generate JWT token\nfor user123
+
+face_service -> audit_log: Log authentication:\n{\n  "event": "face_authentication",\n  "user_id": "user123",\n  "success": true,\n  "similarity_fr": 0.94,\n  "similarity_df": 0.92,\n  "liveness_passed": true,\n  "anti_spoofing_score": 0.97,\n  "timestamp": "2025-11-15T11:00:00Z"\n}
+activate audit_log
+
+audit_log --> face_service: Logged
+deactivate audit_log
+
+face_service --> api_gateway: HTTP 200 OK\n{\n  "authenticated": true,\n  "user_id": "user123",\n  "access_token": "eyJhbGc...",\n  "confidence": 0.93\n}
+deactivate face_service
+activate api_gateway
+
+api_gateway --> mobile_app: Authentication successful
+deactivate api_gateway
+activate mobile_app
+
+mobile_app --> user: ✅ Welcome back, John!\nLogged in successfully
+deactivate mobile_app
+activate user
+deactivate user
+
+== 5. Failed Authentication (No Match) ==
+
+user -> mobile_app: Attempt login\n(different person)
+activate user
+activate mobile_app
+
+note right of user
+  **Scenario: Wrong person tries to login**
+  - Face doesn't match any registered user
+  - Or similarity below threshold
+end note
+
+mobile_app -> api_gateway: POST /api/face/authenticate\n(different face)
+deactivate mobile_app
+activate api_gateway
+
+api_gateway -> face_service: Authenticate
+deactivate api_gateway
+activate face_service
+
+face_service -> face_service: Extract embeddings\nSearch database
+
+face_service -> embeddings_db: Vector similarity search
+activate embeddings_db
+
+embeddings_db --> face_service: Top matches:\nBest: similarity_fr=0.48\nBelow threshold (0.6) ❌
+deactivate embeddings_db
+
+face_service -> face_service: No match found\nsimilarity < threshold
+
+face_service -> audit_log: Log failed attempt:\n{\n  "event": "face_authentication_failed",\n  "reason": "no_match",\n  "best_similarity": 0.48,\n  "threshold": 0.6,\n  "ip": "192.168.1.100"\n}
+activate audit_log
+
+audit_log --> face_service: Logged
+deactivate audit_log
+
+face_service --> api_gateway: HTTP 401 Unauthorized\n{\n  "authenticated": false,\n  "reason": "face_not_recognized"\n}
+deactivate face_service
+activate api_gateway
+
+api_gateway --> mobile_app: Authentication failed
+deactivate api_gateway
+activate mobile_app
+
+mobile_app --> user: ❌ Face not recognized\nPlease try again or use password
+deactivate mobile_app
+deactivate user
+
+== Security & Privacy ==
+
+note over mobile_app, audit_log
+  **Security Best Practices:**
+  
+  ✅ **Liveness Detection:**
+  - Always check for real human
+  - Challenge-response (blink, movement)
+  - Texture analysis
+  - Deep learning anti-spoofing
+  
+  ✅ **Anti-Spoofing:**
+  - Detect photo attacks
+  - Detect video replay
+  - Detect 3D masks
+  - MiniFASNet or similar model
+  
+  ✅ **Multiple Models:**
+  - Use ensemble (face_recognition + DeepFace)
+  - Reduces false accepts
+  - More robust
+  
+  ✅ **Encryption:**
+  - Encrypt embeddings at rest (AES-256)
+  - Biometric data is sensitive PII
+  - GDPR/CCPA compliance
+  
+  ✅ **Privacy:**
+  - Store embeddings, not raw images
+  - Embeddings are one-way (cannot reconstruct face)
+  - User consent required
+  - Allow deletion (right to be forgotten)
+  - Transparent about usage
+  
+  ✅ **Audit Logging:**
+  - Log all authentication attempts
+  - Failed attempts trigger alerts
+  - Monitor for brute force
+  - SIEM integration
+  
+  ✅ **Fallback Authentication:**
+  - Face recognition + PIN/password (2FA)
+  - Face recognition can fail (lighting, angle)
+  - Always provide alternative
+  
+  ⚠️ **Limitations:**
+  
+  **Identical Twins:**
+  - High similarity (0.8+)
+  - Hard to distinguish
+  - Solution: Add PIN or other factor
+  
+  **Aging:**
+  - Face changes over time
+  - Re-enroll periodically (yearly)
+  - Update embeddings
+  
+  **Lighting:**
+  - Poor lighting affects accuracy
+  - Backlit faces fail detection
+  - Solution: Guide user to good lighting
+  
+  **Glasses/Makeup:**
+  - Changes appearance
+  - May reduce similarity
+  - Solution: Enroll with different looks
+  
+  **Attacks:**
+  - Deepfakes (generated faces)
+  - 3D-printed masks
+  - High-quality photos/videos
+  - Solution: Multi-modal (face + voice + behavior)
+  
+  **Legal/Ethical:**
+  - GDPR, CCPA, BIPA (Illinois)
+  - Informed consent required
+  - Purpose limitation
+  - Data minimization
+  - Right to deletion
+  - Transparency
+  
+  **Use Cases:**
+  
+  ✅ **Good:**
+  - Phone unlock (convenience)
+  - Office access (physical security)
+  - Airport security (identity verification)
+  - Banking app (2FA)
+  - Payment authorization
+  
+  ⚠️ **Questionable:**
+  - Surveillance (privacy concerns)
+  - Emotion detection (pseudoscience)
+  - Hiring decisions (bias)
+  - Law enforcement (false positives, racial bias)
+end note
+
+@enduml

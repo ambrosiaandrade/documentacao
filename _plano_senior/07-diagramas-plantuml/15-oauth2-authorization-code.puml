@@ -1,0 +1,703 @@
+@startuml OAuth 2.0 Authorization Code Flow
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title OAuth 2.0 - Authorization Code Flow (com PKCE)
+
+actor "User\n(Resource Owner)" as user
+participant "Client App\n(SPA/Mobile)" as client
+participant "Authorization Server\n(Keycloak/Auth0)" as auth_server
+participant "Resource Server\n(API)" as resource_server
+database "Token Store\n(Redis)" as token_store
+database "User DB\n(PostgreSQL)" as user_db
+
+== 1. Client Registration (One-time Setup) ==
+
+client -> auth_server: POST /register\n{\n  "client_name": "MyApp",\n  "redirect_uris": [\n    "https://myapp.com/callback"\n  ],\n  "grant_types": [\n    "authorization_code"\n  ]\n}
+activate client
+activate auth_server
+
+note right of auth_server
+  **Client Registration:**
+  
+  Client types:
+  - Confidential: Can keep secret (backend)
+  - Public: Cannot keep secret (SPA, mobile)
+  
+  **PKCE Required for public clients!**
+end note
+
+auth_server -> auth_server: Generate credentials
+
+auth_server --> client: {\n  "client_id": "abc123",\n  "client_secret": "secret789"\n}
+deactivate auth_server
+deactivate client
+
+note right of client
+  **Store Securely:**
+  - client_id: Public identifier
+  - client_secret: NEVER expose in frontend!
+  
+  **For SPA/Mobile:**
+  - client_id only
+  - No client_secret
+  - PKCE mandatory
+end note
+
+== 2. Authorization Request (PKCE) ==
+
+user -> client: Click "Login with Google/GitHub"
+activate user
+activate client
+
+client -> client: Generate PKCE:\ncode_verifier = random(43-128 chars)\ncode_challenge = \n  BASE64URL(SHA256(code_verifier))\ncode_challenge_method = "S256"
+
+note right of client
+  **PKCE (Proof Key for Code Exchange):**
+  
+  ```javascript
+  // Generate code verifier (random string)
+  const codeVerifier = 
+    generateRandomString(128);
+  
+  // Generate code challenge (SHA256 hash)
+  const codeChallenge = 
+    base64UrlEncode(
+      sha256(codeVerifier)
+    );
+  
+  // Store code_verifier securely
+  sessionStorage.setItem(
+    'code_verifier', 
+    codeVerifier
+  );
+  ```
+  
+  **Why PKCE?**
+  - Prevents authorization code interception
+  - Required for public clients (SPA, mobile)
+  - Recommended for all clients
+end note
+
+client -> client: Generate state:\nstate = random()\nstore in session
+
+client --> user: Redirect to:\n/authorize?response_type=code\n  &client_id=abc123\n  &redirect_uri=https://myapp.com/callback\n  &scope=openid profile email\n  &state=xyz789\n  &code_challenge=E9Melhoa...\n  &code_challenge_method=S256
+deactivate client
+
+user -> auth_server: GET /authorize\n?response_type=code\n&client_id=abc123\n&redirect_uri=...\n&scope=openid profile email\n&state=xyz789\n&code_challenge=E9Melhoa...\n&code_challenge_method=S256
+activate auth_server
+
+note right of auth_server
+  **Query Parameters:**
+  
+  - response_type=code (Authorization Code flow)
+  - client_id: Registered client identifier
+  - redirect_uri: Where to send code
+  - scope: Permissions requested
+  - state: CSRF protection (client-generated)
+  - code_challenge: PKCE challenge
+  - code_challenge_method: S256 (SHA256)
+end note
+
+auth_server -> auth_server: Validate request:\n✓ client_id registered?\n✓ redirect_uri matches?\n✓ scope allowed?\n✓ PKCE present?
+
+auth_server --> user: Show login page:\n"MyApp wants to access:\n- Your profile\n- Your email\n\nLogin with:\n[Google] [GitHub] [Email]"
+deactivate auth_server
+
+== 3. User Authentication ==
+
+user -> auth_server: POST /login\n{\n  "username": "john@example.com",\n  "password": "***"\n}
+activate auth_server
+
+note right of user
+  **Authentication Methods:**
+  - Username/Password
+  - Social Login (Google, GitHub, Facebook)
+  - MFA (TOTP, SMS, Biometric)
+  - Passwordless (Magic Link, WebAuthn)
+end note
+
+auth_server -> user_db: SELECT * FROM users\nWHERE email = 'john@example.com'
+activate user_db
+
+user_db --> auth_server: User found:\nid=456\npassword_hash=$2a$10...
+deactivate user_db
+
+auth_server -> auth_server: Verify password:\nbcrypt.compare(\n  password,\n  password_hash\n)
+
+note right of auth_server
+  **Password Verification:**
+  
+  ```java
+  @Service
+  public class AuthService {
+    public User authenticate(
+      String email, String password
+    ) {
+      User user = userRepo
+        .findByEmail(email)
+        .orElseThrow(() -> 
+          new BadCredentialsException()
+        );
+      
+      if (!passwordEncoder.matches(
+        password, user.getPasswordHash()
+      )) {
+        throw new BadCredentialsException();
+      }
+      
+      return user;
+    }
+  }
+  ```
+end note
+
+auth_server -> auth_server: Password valid ✅\nCreate session
+
+auth_server --> user: Session cookie set\nShow consent screen:\n"Allow MyApp to:\n✓ View your profile\n✓ Access your email\n\n[Allow] [Deny]"
+deactivate auth_server
+
+== 4. User Consent ==
+
+user -> auth_server: POST /consent\n{\n  "allow": true,\n  "scope": "openid profile email"\n}
+activate auth_server
+
+note right of user
+  **Consent Screen:**
+  - First-time apps require consent
+  - Returning apps may skip (if scope unchanged)
+  - Users can revoke consent later
+  - Enterprise: Admin consent for all users
+end note
+
+auth_server -> auth_server: Consent granted ✅\nGenerate authorization code
+
+auth_server -> token_store: SET authorization_code:abc...\n{\n  "client_id": "abc123",\n  "user_id": "456",\n  "redirect_uri": "https://myapp.com/callback",\n  "scope": "openid profile email",\n  "code_challenge": "E9Melhoa...",\n  "expires_at": "2025-11-15T10:35:00Z"\n}\nEX 600 (10 min TTL)
+activate token_store
+
+note right of token_store
+  **Authorization Code:**
+  
+  - Single-use only
+  - Short-lived (10 minutes)
+  - Bound to:
+    * client_id
+    * redirect_uri
+    * code_challenge (PKCE)
+  - Cannot be reused
+  
+  **Storage:**
+  - Redis (fast, auto-expiry)
+  - Database (with cleanup job)
+  - In-memory (single server only)
+end note
+
+token_store --> auth_server: stored
+deactivate token_store
+
+auth_server --> user: HTTP 302 Redirect:\nLocation: https://myapp.com/callback\n  ?code=AUTH_CODE_abc123def456\n  &state=xyz789
+deactivate auth_server
+
+== 5. Token Exchange ==
+
+user -> client: GET /callback\n?code=AUTH_CODE_abc123def456\n&state=xyz789
+deactivate user
+activate client
+
+client -> client: Validate state:\nstored_state == received_state?\nYES ✅
+
+note right of client
+  **State Validation (CSRF Protection):**
+  
+  ```javascript
+  const receivedState = 
+    urlParams.get('state');
+  
+  const storedState = 
+    sessionStorage.getItem('oauth_state');
+  
+  if (receivedState !== storedState) {
+    throw new Error('CSRF detected!');
+  }
+  
+  // Retrieve code_verifier
+  const codeVerifier = 
+    sessionStorage.getItem('code_verifier');
+  ```
+end note
+
+client -> client: Retrieve code_verifier\nfrom session storage
+
+client -> auth_server: POST /token\nContent-Type: application/x-www-form-urlencoded\n\ngrant_type=authorization_code\n&code=AUTH_CODE_abc123def456\n&redirect_uri=https://myapp.com/callback\n&client_id=abc123\n&client_secret=secret789\n&code_verifier=ORIGINAL_VERIFIER
+activate auth_server
+
+note right of client
+  **Token Request:**
+  
+  ```bash
+  curl -X POST https://auth.example.com/token \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=authorization_code" \
+    -d "code=AUTH_CODE_abc123def456" \
+    -d "redirect_uri=https://myapp.com/callback" \
+    -d "client_id=abc123" \
+    -d "client_secret=secret789" \
+    -d "code_verifier=ORIGINAL_VERIFIER"
+  ```
+  
+  **For Public Clients (no secret):**
+  - Omit client_secret
+  - MUST include code_verifier (PKCE)
+end note
+
+auth_server -> token_store: GET authorization_code:abc...
+activate token_store
+
+token_store --> auth_server: {\n  "client_id": "abc123",\n  "user_id": "456",\n  "redirect_uri": "...",\n  "code_challenge": "E9Melhoa...",\n  "expires_at": "2025-11-15T10:35:00Z"\n}
+deactivate token_store
+
+auth_server -> auth_server: Validate:\n✓ code exists?\n✓ not expired?\n✓ client_id matches?\n✓ redirect_uri matches?\n✓ PKCE: SHA256(code_verifier) == code_challenge?\n✓ code not used before?
+
+note right of auth_server
+  **PKCE Verification:**
+  
+  ```java
+  // Client sends code_verifier
+  String receivedVerifier = request.getParameter("code_verifier");
+  
+  // Server has stored code_challenge
+  String storedChallenge = authCode.getCodeChallenge();
+  
+  // Compute challenge from verifier
+  String computedChallenge = 
+    base64UrlEncode(
+      sha256(receivedVerifier)
+    );
+  
+  // Compare
+  if (!computedChallenge.equals(storedChallenge)) {
+    throw new InvalidGrantException(
+      "code_verifier does not match code_challenge"
+    );
+  }
+  ```
+  
+  **This proves:**
+  - Same client that started flow
+  - Not intercepted by attacker
+end note
+
+auth_server -> auth_server: All valid ✅\nGenerate tokens
+
+auth_server -> auth_server: Create Access Token (JWT):\nheader.payload.signature
+
+auth_server -> auth_server: Create Refresh Token:\nrandom secure token
+
+auth_server -> token_store: SET refresh_token:refresh_abc...\n{\n  "user_id": "456",\n  "client_id": "abc123",\n  "scope": "openid profile email",\n  "issued_at": "2025-11-15T10:30:00Z"\n}\nEX 2592000 (30 days)
+activate token_store
+
+note right of token_store
+  **Refresh Token Storage:**
+  
+  - Long-lived (days/months)
+  - Stored server-side
+  - Revocable
+  - Family rotation (detect theft)
+  
+  **Access Token:**
+  - Short-lived (minutes/hours)
+  - NOT stored server-side (stateless JWT)
+  - Validated by signature
+end note
+
+token_store --> auth_server: stored
+deactivate token_store
+
+auth_server -> token_store: DEL authorization_code:abc...\n(single-use, prevent replay)
+activate token_store
+token_store --> auth_server: deleted
+deactivate token_store
+
+auth_server --> client: HTTP 200 OK\n{\n  "access_token": "eyJhbGc...JWT",\n  "token_type": "Bearer",\n  "expires_in": 3600,\n  "refresh_token": "refresh_abc...",\n  "scope": "openid profile email",\n  "id_token": "eyJhbGc...JWT"\n}
+deactivate auth_server
+
+note right of client
+  **Token Response:**
+  
+  - access_token: For API calls (JWT)
+  - refresh_token: Get new access_token
+  - id_token: User info (OpenID Connect)
+  - expires_in: 3600 seconds (1 hour)
+  - token_type: Bearer (Authorization header)
+  
+  **Store Securely:**
+  - Memory (best for SPA)
+  - HttpOnly cookie (CSRF protection needed)
+  - Secure storage (mobile keychain)
+  - NEVER localStorage/sessionStorage (XSS risk!)
+end note
+
+client -> client: Store tokens securely:\n- access_token in memory\n- refresh_token in HttpOnly cookie
+
+client --> user: Login successful!\nRedirect to dashboard
+activate user
+deactivate client
+
+== 6. API Request with Access Token ==
+
+user -> client: GET /dashboard
+deactivate user
+activate client
+
+client -> resource_server: GET /api/user/profile\nAuthorization: Bearer eyJhbGc...JWT
+deactivate client
+activate resource_server
+
+note right of resource_server
+  **Authorization Header:**
+  
+  ```
+  Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0NTYiLCJzY29wZSI6Im9wZW5pZCBwcm9maWxlIGVtYWlsIiwiaWF0IjoxNzAwMDAwMDAwLCJleHAiOjE3MDAwMDM2MDB9.signature
+  ```
+  
+  **JWT Payload:**
+  ```json
+  {
+    "sub": "456",
+    "scope": "openid profile email",
+    "iat": 1700000000,
+    "exp": 1700003600,
+    "iss": "https://auth.example.com",
+    "aud": "https://api.example.com"
+  }
+  ```
+end note
+
+resource_server -> resource_server: Extract JWT from header
+
+resource_server -> resource_server: Validate JWT:\n✓ Signature valid? (RSA/HMAC)\n✓ Not expired? (exp claim)\n✓ Issuer correct? (iss claim)\n✓ Audience correct? (aud claim)\n✓ Scope sufficient?
+
+note right of resource_server
+  **JWT Validation (Spring Security):**
+  
+  ```java
+  @Configuration
+  public class SecurityConfig {
+    @Bean
+    public SecurityFilterChain filterChain(
+      HttpSecurity http
+    ) throws Exception {
+      http
+        .oauth2ResourceServer(oauth2 -> 
+          oauth2.jwt(jwt -> 
+            jwt.decoder(jwtDecoder())
+          )
+        )
+        .authorizeHttpRequests(auth -> 
+          auth
+            .requestMatchers("/api/admin/**")
+              .hasAuthority("SCOPE_admin")
+            .requestMatchers("/api/user/**")
+              .hasAuthority("SCOPE_profile")
+            .anyRequest().authenticated()
+        );
+      
+      return http.build();
+    }
+    
+    @Bean
+    public JwtDecoder jwtDecoder() {
+      // Fetch public key from auth server
+      return NimbusJwtDecoder
+        .withJwkSetUri(
+          "https://auth.example.com/.well-known/jwks.json"
+        )
+        .build();
+    }
+  }
+  ```
+end note
+
+resource_server -> resource_server: JWT valid ✅\nExtract user_id: 456
+
+resource_server -> user_db: SELECT * FROM users\nWHERE id = 456
+activate user_db
+
+user_db --> resource_server: User:\nname="John Doe"\nemail="john@example.com"
+deactivate user_db
+
+resource_server --> client: HTTP 200 OK\n{\n  "id": "456",\n  "name": "John Doe",\n  "email": "john@example.com"\n}
+deactivate resource_server
+activate client
+
+client --> user: Display profile:\n"Welcome, John Doe!\njohn@example.com"
+deactivate client
+activate user
+
+== 7. Token Refresh (Access Token Expired) ==
+
+user -> client: GET /api/orders
+deactivate user
+activate client
+
+client -> resource_server: GET /api/orders\nAuthorization: Bearer eyJhbGc...EXPIRED_JWT
+deactivate client
+activate resource_server
+
+resource_server -> resource_server: Validate JWT:\nexp=1700003600\nnow=1700004000\nExpired! ❌
+
+resource_server --> client: HTTP 401 Unauthorized\n{\n  "error": "invalid_token",\n  "error_description": "Token expired"\n}
+deactivate resource_server
+activate client
+
+note right of client
+  **Token Expiration:**
+  
+  - Access tokens short-lived (1 hour typical)
+  - Reduces impact of token theft
+  - Refresh token used to get new access token
+  - Transparent to user (no re-login)
+end note
+
+client -> client: Access token expired!\nUse refresh token
+
+client -> auth_server: POST /token\nContent-Type: application/x-www-form-urlencoded\n\ngrant_type=refresh_token\n&refresh_token=refresh_abc...\n&client_id=abc123\n&client_secret=secret789\n&scope=openid profile email
+activate auth_server
+
+note right of client
+  **Refresh Token Request:**
+  
+  ```bash
+  curl -X POST https://auth.example.com/token \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=refresh_token" \
+    -d "refresh_token=refresh_abc..." \
+    -d "client_id=abc123" \
+    -d "client_secret=secret789"
+  ```
+  
+  **Scope:**
+  - Can request narrower scope
+  - Cannot request broader scope
+  - Omit to keep same scope
+end note
+
+auth_server -> token_store: GET refresh_token:refresh_abc...
+activate token_store
+
+token_store --> auth_server: {\n  "user_id": "456",\n  "client_id": "abc123",\n  "scope": "openid profile email",\n  "issued_at": "2025-11-15T10:30:00Z"\n}
+deactivate token_store
+
+auth_server -> auth_server: Validate:\n✓ refresh_token exists?\n✓ not expired?\n✓ client_id matches?\n✓ not revoked?
+
+auth_server -> auth_server: All valid ✅\nGenerate NEW tokens
+
+auth_server -> auth_server: Rotate refresh token:\nOLD: refresh_abc...\nNEW: refresh_xyz...
+
+note right of auth_server
+  **Refresh Token Rotation:**
+  
+  ```java
+  // Delete old refresh token
+  tokenStore.delete("refresh_token:" + oldToken);
+  
+  // Generate new refresh token
+  String newRefreshToken = generateSecureToken();
+  
+  // Store new refresh token
+  tokenStore.set(
+    "refresh_token:" + newRefreshToken,
+    tokenData,
+    Duration.ofDays(30)
+  );
+  
+  // Return both new access + refresh tokens
+  ```
+  
+  **Why Rotate?**
+  - Detect token theft
+  - If old token used again → revoke all
+  - Limits damage from stolen refresh token
+end note
+
+auth_server -> token_store: DEL refresh_token:refresh_abc...\n(old token invalidated)
+activate token_store
+token_store --> auth_server: deleted
+deactivate token_store
+
+auth_server -> token_store: SET refresh_token:refresh_xyz...\n(new token)
+activate token_store
+token_store --> auth_server: stored
+deactivate token_store
+
+auth_server --> client: HTTP 200 OK\n{\n  "access_token": "eyJhbGc...NEW_JWT",\n  "token_type": "Bearer",\n  "expires_in": 3600,\n  "refresh_token": "refresh_xyz...",\n  "scope": "openid profile email"\n}
+deactivate auth_server
+
+client -> client: Update stored tokens
+
+client -> resource_server: GET /api/orders\nAuthorization: Bearer eyJhbGc...NEW_JWT\n(retry original request)
+activate resource_server
+
+resource_server -> resource_server: Validate JWT:\nNEW token valid ✅
+
+resource_server --> client: HTTP 200 OK\n[\n  {"id": "ORD-1", "total": 150},\n  {"id": "ORD-2", "total": 200}\n]
+deactivate resource_server
+
+client --> user: Display orders\n(user unaware of refresh!)
+deactivate client
+activate user
+
+== 8. Token Revocation (Logout) ==
+
+user -> client: Click "Logout"
+deactivate user
+activate client
+
+client -> auth_server: POST /revoke\nContent-Type: application/x-www-form-urlencoded\n\ntoken=refresh_xyz...\n&client_id=abc123\n&client_secret=secret789
+activate auth_server
+
+note right of client
+  **Token Revocation (RFC 7009):**
+  
+  ```bash
+  curl -X POST https://auth.example.com/revoke \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "token=refresh_xyz..." \
+    -d "client_id=abc123" \
+    -d "client_secret=secret789"
+  ```
+  
+  **Revoke:**
+  - Refresh token (mandatory)
+  - Access token (optional - expires soon anyway)
+  - All user's tokens (logout everywhere)
+end note
+
+auth_server -> token_store: DEL refresh_token:refresh_xyz...
+activate token_store
+
+token_store --> auth_server: deleted
+deactivate token_store
+
+auth_server -> token_store: ADD revoked_tokens:\neyJhbGc...NEW_JWT\n(blacklist access token until expiry)
+activate token_store
+
+note right of token_store
+  **Access Token Blacklist:**
+  
+  - JWT is stateless (cannot "delete")
+  - Add to blacklist until natural expiry
+  - Resource server checks blacklist
+  - TTL = remaining token lifetime
+  
+  **Alternative:**
+  - Shorter access token TTL (5-15 min)
+  - Don't blacklist (wait for expiry)
+  - Trade-off: Security vs Performance
+end note
+
+token_store --> auth_server: blacklisted
+deactivate token_store
+
+auth_server --> client: HTTP 200 OK\n(token revoked)
+deactivate auth_server
+
+client -> client: Clear stored tokens\nClear session
+
+client --> user: Logged out successfully\nRedirect to login
+deactivate client
+activate user
+deactivate user
+
+== Security Considerations ==
+
+note over client, token_store
+  **Best Practices:**
+  
+  ✅ **Always use PKCE:**
+  - Required for public clients (SPA, mobile)
+  - Recommended for all clients
+  - Prevents authorization code interception
+  
+  ✅ **Short-lived Access Tokens:**
+  - 15-60 minutes typical
+  - Reduces impact of token theft
+  - Use refresh tokens for long sessions
+  
+  ✅ **Rotate Refresh Tokens:**
+  - Detect token theft
+  - Invalidate old tokens
+  - Family chain tracking
+  
+  ✅ **Validate Everything:**
+  - state parameter (CSRF)
+  - redirect_uri (exact match)
+  - client credentials
+  - JWT signature, expiry, claims
+  
+  ✅ **Secure Token Storage:**
+  - Memory (best for SPA)
+  - HttpOnly cookies (with SameSite)
+  - Mobile secure storage (Keychain/Keystore)
+  - NEVER localStorage (XSS vulnerable!)
+  
+  ✅ **HTTPS Only:**
+  - All OAuth endpoints over TLS
+  - No mixed content
+  - HSTS headers
+  
+  ⚠️ **Common Vulnerabilities:**
+  
+  **Authorization Code Interception:**
+  - Mitigated by PKCE
+  - Deep link hijacking (mobile)
+  
+  **Token Theft:**
+  - XSS attacks (steal from localStorage)
+  - Mitigated: Memory storage, HttpOnly cookies
+  
+  **CSRF:**
+  - Mitigated by state parameter
+  - Validate on every flow
+  
+  **Refresh Token Replay:**
+  - Mitigated by token rotation
+  - Detect reuse → revoke all tokens
+  
+  **Open Redirect:**
+  - Validate redirect_uri exactly
+  - Allowlist registered URIs only
+  
+  **Use Cases:**
+  
+  - **Third-party Apps:** Access user data
+  - **SSO (Single Sign-On):** One login, multiple apps
+  - **Mobile Apps:** Native app authentication
+  - **SPAs:** Frontend-only applications
+  - **Microservices:** Service-to-service auth
+  
+  **OAuth 2.0 Flows:**
+  
+  1. **Authorization Code (this diagram):**
+     - Most secure
+     - Server-side + client-side
+     - Supports refresh tokens
+  
+  2. **Client Credentials:**
+     - Machine-to-machine
+     - No user involved
+     - Service accounts
+  
+  3. **Implicit (DEPRECATED):**
+     - Direct access token in URL
+     - No refresh token
+     - Use Authorization Code + PKCE instead
+  
+  4. **Password (DEPRECATED):**
+     - User credentials to client
+     - Only for highly trusted clients
+     - Use Authorization Code instead
+end note
+
+@enduml

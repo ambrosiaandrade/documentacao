@@ -1,0 +1,416 @@
+@startuml Rate Limiting - Token Bucket Algorithm
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Rate Limiting - Token Bucket Algorithm
+
+actor Cliente as client
+participant "API Gateway" as gateway
+participant "Rate Limiter\n(Token Bucket)" as limiter
+database "Token Bucket\n(Redis)" as redis
+participant "Backend\nService" as backend
+
+== Inicialização do Bucket ==
+
+gateway -> limiter: initialize()
+activate limiter
+limiter -> redis: createBucket(\n  key: "client:user123",\n  capacity: 10,\n  refillRate: 2 tokens/sec)
+activate redis
+redis -> redis: SET bucket:user123:tokens 10
+redis -> redis: SET bucket:user123:lastRefill NOW()
+redis --> limiter: bucket created
+deactivate redis
+limiter --> gateway: initialized
+deactivate limiter
+
+note right of redis
+  **Token Bucket Configurado:**
+  - Capacity: 10 tokens (burst)
+  - Refill Rate: 2 tokens/segundo
+  - Atual: 10/10 tokens disponíveis
+  - Last Refill: 2025-11-15 10:00:00
+  
+  **Comportamento:**
+  - Cliente pode fazer até 10 requests instantâneos
+  - Depois, limitado a 2 req/s
+end note
+
+== Request 1: Bucket Cheio (Permitido) ==
+
+client -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire(clientId: "user123")
+activate limiter
+
+limiter -> redis: GET bucket:user123:tokens
+activate redis
+redis --> limiter: tokens = 10
+deactivate redis
+
+limiter -> limiter: currentTime = NOW()
+limiter -> limiter: tokensAvailable = 10
+limiter -> limiter: tokensAvailable >= 1? YES ✅
+
+limiter -> redis: DECR bucket:user123:tokens
+activate redis
+redis -> redis: tokens = 10 - 1 = 9
+redis --> limiter: new value = 9
+deactivate redis
+
+limiter --> gateway: ALLOWED (tokens: 9/10)
+deactivate limiter
+
+gateway -> backend: forward request
+activate backend
+backend --> gateway: response
+deactivate backend
+
+gateway --> client: 200 OK\nX-RateLimit-Limit: 10\nX-RateLimit-Remaining: 9\nX-RateLimit-Reset: 1700049600
+deactivate gateway
+
+note right of limiter
+  Request 1: ✅ PERMITIDO
+  - Tokens antes: 10
+  - Tokens consumidos: 1
+  - Tokens restantes: 9
+  - Status: ALLOWED
+end note
+
+== Requests 2-10: Consumindo Burst ==
+
+loop 9 requests rápidas
+  client -> gateway: GET /api/products
+  activate gateway
+  gateway -> limiter: tryAcquire("user123")
+  activate limiter
+  
+  limiter -> redis: GET bucket:user123:tokens
+  activate redis
+  redis --> limiter: tokens > 0
+  deactivate redis
+  
+  limiter -> redis: DECR bucket:user123:tokens
+  activate redis
+  redis --> limiter: decremented
+  deactivate redis
+  
+  limiter --> gateway: ALLOWED
+  deactivate limiter
+  
+  gateway -> backend: forward request
+  backend --> gateway: response
+  gateway --> client: 200 OK\nX-RateLimit-Remaining: {remaining}
+  deactivate gateway
+end
+
+note right of redis
+  Após 10 requests rápidas:
+  - Tokens: 0/10
+  - Bucket vazio!
+  - Próximos requests dependerão do refill
+  - Tempo: ~10:00:00 (instantâneo)
+end note
+
+== Request 11: Bucket Vazio (Rejeitado) ==
+
+client -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire("user123")
+activate limiter
+
+limiter -> redis: GET bucket:user123:tokens
+activate redis
+redis --> limiter: tokens = 0
+deactivate redis
+
+limiter -> limiter: tokensAvailable = 0
+limiter -> limiter: tokensAvailable >= 1? NO ❌
+
+limiter --> gateway: ❌ REJECTED\n(tokens: 0/10)
+deactivate limiter
+
+gateway --> client: ❌ 429 Too Many Requests\nX-RateLimit-Limit: 10\nX-RateLimit-Remaining: 0\nX-RateLimit-Reset: 1700049601\nRetry-After: 1
+deactivate gateway
+
+note right of client
+  Request 11: ❌ REJEITADO
+  - Tokens: 0/10
+  - Burst consumido
+  - HTTP 429 Too Many Requests
+  - Retry-After: 1 segundo
+  
+  Cliente deve aguardar refill
+end note
+
+== Refill Automático (Background) ==
+
+... Aguardando 0.5 segundos ...
+
+limiter -> limiter: refillTimer triggered (500ms)
+activate limiter
+
+limiter -> redis: GET bucket:user123:lastRefill
+activate redis
+redis --> limiter: lastRefill = 10:00:00.000
+deactivate redis
+
+limiter -> limiter: currentTime = 10:00:00.500
+limiter -> limiter: elapsed = 0.5s
+limiter -> limiter: tokensToAdd = elapsed * refillRate\n  = 0.5s * 2 tokens/s = 1 token
+
+limiter -> redis: GET bucket:user123:tokens
+activate redis
+redis --> limiter: currentTokens = 0
+deactivate redis
+
+limiter -> limiter: newTokens = min(\n  currentTokens + tokensToAdd,\n  capacity)\n= min(0 + 1, 10) = 1
+
+limiter -> redis: MULTI
+activate redis
+redis -> redis: SET bucket:user123:tokens 1
+redis -> redis: SET bucket:user123:lastRefill 10:00:00.500
+redis -> redis: EXEC
+redis --> limiter: updated
+deactivate redis
+
+limiter --> limiter: refill complete
+deactivate limiter
+
+note right of redis
+  Refill após 0.5s:
+  - Tokens adicionados: 1
+  - Tokens atuais: 1/10
+  - Last Refill: 10:00:00.500
+  
+  **Refill Rate: 2 tokens/s**
+  - A cada 0.5s → +1 token
+  - A cada 1.0s → +2 tokens
+  - A cada 5.0s → +10 tokens (full bucket)
+end note
+
+== Request 12: Após Refill (Permitido) ==
+
+client -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire("user123")
+activate limiter
+
+limiter -> redis: GET bucket:user123:tokens
+activate redis
+redis --> limiter: tokens = 1
+deactivate redis
+
+limiter -> limiter: tokensAvailable = 1
+limiter -> limiter: tokensAvailable >= 1? YES ✅
+
+limiter -> redis: DECR bucket:user123:tokens
+activate redis
+redis --> limiter: new value = 0
+deactivate redis
+
+limiter --> gateway: ALLOWED (tokens: 0/10)
+deactivate limiter
+
+gateway -> backend: forward request
+backend --> gateway: response
+gateway --> client: 200 OK\nX-RateLimit-Remaining: 0
+deactivate gateway
+
+note right of limiter
+  Request 12: ✅ PERMITIDO
+  - Beneficiou do refill (+1 token)
+  - Tokens consumidos: 1
+  - Tokens restantes: 0
+  - Próximo token em: 0.5s
+end note
+
+== Request 13: Bucket Vazio Novamente ==
+
+client -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire("user123")
+activate limiter
+
+limiter -> redis: GET bucket:user123:tokens
+activate redis
+redis --> limiter: tokens = 0
+deactivate redis
+
+limiter --> gateway: ❌ REJECTED
+deactivate limiter
+gateway --> client: ❌ 429 Too Many Requests
+deactivate gateway
+
+... Aguardando 1 segundo (2 tokens refill) ...
+
+== Request 14: Após 1 Segundo de Espera ==
+
+limiter -> limiter: refillTimer (1s elapsed)
+limiter -> redis: incrby bucket:user123:tokens 2
+redis --> limiter: new value = 2
+
+client -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire("user123")
+activate limiter
+limiter -> redis: GET bucket:user123:tokens
+redis --> limiter: tokens = 2
+limiter -> redis: DECR bucket:user123:tokens
+redis --> limiter: new value = 1
+limiter --> gateway: ALLOWED (tokens: 1/10)
+deactivate limiter
+gateway -> backend: forward request
+backend --> gateway: response
+gateway --> client: 200 OK\nX-RateLimit-Remaining: 1
+deactivate gateway
+
+note right of client
+  Cliente aprendeu a lição! 😊
+  - Aguardou 1s
+  - Recebeu 2 tokens de refill
+  - Consumiu 1 token
+  - Restam 1 token
+  
+  **Taxa sustentável: 2 req/s**
+end note
+
+== Comparação: Multiple Clients ==
+
+actor "Cliente 2" as client2
+
+client2 -> gateway: GET /api/products
+activate gateway
+gateway -> limiter: tryAcquire("user456")
+activate limiter
+
+limiter -> redis: GET bucket:user456:tokens
+activate redis
+redis --> limiter: bucket not found
+deactivate redis
+
+limiter -> redis: createBucket(\n  key: "user456",\n  capacity: 10,\n  refillRate: 2/s)
+activate redis
+redis -> redis: SET bucket:user456:tokens 10
+redis --> limiter: created
+deactivate redis
+
+limiter -> redis: DECR bucket:user456:tokens
+redis --> limiter: new value = 9
+
+limiter --> gateway: ALLOWED (tokens: 9/10)
+deactivate limiter
+
+gateway -> backend: forward request
+backend --> gateway: response
+gateway --> client2: 200 OK\nX-RateLimit-Remaining: 9
+deactivate gateway
+
+note right of limiter
+  **Isolamento por Cliente:**
+  - user123: 1/10 tokens (quase vazio)
+  - user456: 9/10 tokens (novo bucket)
+  
+  Cada cliente tem seu próprio bucket!
+  Rate limit de um não afeta o outro.
+end note
+
+== Implementação Redis (Lua Script) ==
+
+note over redis
+  **Lua Script Atômico (Redis):**
+  
+  ```lua
+  local key = KEYS[1]
+  local capacity = tonumber(ARGV[1])
+  local refill_rate = tonumber(ARGV[2])
+  local requested = tonumber(ARGV[3])
+  local now = tonumber(ARGV[4])
+  
+  -- Get current state
+  local tokens = tonumber(redis.call('GET', key .. ':tokens') or capacity)
+  local last_refill = tonumber(redis.call('GET', key .. ':lastRefill') or now)
+  
+  -- Calculate refill
+  local elapsed = now - last_refill
+  local tokens_to_add = elapsed * refill_rate
+  tokens = math.min(capacity, tokens + tokens_to_add)
+  
+  -- Try to acquire
+  local allowed = 0
+  if tokens >= requested then
+    tokens = tokens - requested
+    allowed = 1
+  end
+  
+  -- Update state
+  redis.call('SET', key .. ':tokens', tokens)
+  redis.call('SET', key .. ':lastRefill', now)
+  redis.call('EXPIRE', key .. ':tokens', 3600)
+  redis.call('EXPIRE', key .. ':lastRefill', 3600)
+  
+  return {allowed, tokens}
+  ```
+  
+  **Benefícios:**
+  - Operação atômica (sem race conditions)
+  - Refill calculado on-demand
+  - Performance: ~0.1-0.5ms por request
+end note
+
+== Configuração Diferentes Tiers ==
+
+note over limiter
+  **Rate Limits por Tier de Cliente:**
+  
+  | Tier      | Capacity | Refill Rate | Burst | Sustentável |
+  |-----------|----------|-------------|-------|-------------|
+  | Free      | 10       | 2/s         | 10    | 2 req/s     |
+  | Basic     | 50       | 10/s        | 50    | 10 req/s    |
+  | Pro       | 200      | 50/s        | 200   | 50 req/s    |
+  | Enterprise| 1000     | 200/s       | 1000  | 200 req/s   |
+  
+  **Identificação:**
+  - Header: X-API-Key → lookup tier
+  - JWT token → claim "tier"
+  - IP → default (Free)
+  
+  **Scope:**
+  - Per-User: bucket:user:{userId}
+  - Per-IP: bucket:ip:{ipAddress}
+  - Per-Endpoint: bucket:user:{userId}:endpoint:{path}
+  - Global: bucket:global (todos compartilham)
+end note
+
+== Métricas e Alertas ==
+
+limiter -> limiter: recordMetrics()
+note right of limiter
+  **Métricas:**
+  
+  rate_limit.requests.allowed.total
+    {client: "user123", tier: "free"} = 12
+  
+  rate_limit.requests.rejected.total
+    {client: "user123", tier: "free"} = 2
+  
+  rate_limit.rejection.rate
+    = rejected / (allowed + rejected)
+    = 2 / (12 + 2) = 14.3%
+  
+  rate_limit.tokens.available
+    {client: "user123"} = 1/10
+  
+  **Alertas:**
+  - rejection_rate > 20% → Warning
+  - rejection_rate > 50% → Critical
+  - tokens = 0 por > 1min → Warning
+  
+  **Dashboard:**
+  - Rejection rate por tier
+  - Top 10 clients por requests
+  - Tokens médios disponíveis
+  - Latência do Redis
+end note
+
+@enduml

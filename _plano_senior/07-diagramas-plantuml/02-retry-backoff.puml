@@ -1,0 +1,257 @@
+@startuml Retry Pattern - Estratégias de Backoff
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Retry Pattern - Backoff Exponencial com Jitter
+
+actor Cliente as client
+participant "Retry Handler" as retry
+participant "Backoff\nCalculator" as backoff
+participant "Serviço\nExterno" as service
+database "Retry Config" as config
+
+== Configuração Inicial ==
+
+client -> retry: configure()
+activate retry
+retry -> config: setMaxAttempts(5)
+retry -> config: setInitialDelay(1s)
+retry -> config: setMaxDelay(30s)
+retry -> config: setMultiplier(2.0)
+retry -> config: setJitter(0.1)
+retry -> config: setRetryableExceptions(\n  [TimeoutException,\n   ServiceUnavailableException])
+config --> retry: configured
+retry --> client: ready
+deactivate retry
+
+note right of config
+  Configuração:
+  - maxAttempts: 5
+  - initialDelay: 1s
+  - maxDelay: 30s
+  - multiplier: 2.0
+  - jitter: ±10%
+  - Retry apenas erros transientes
+end note
+
+== Tentativa 1 (Falha) ==
+
+client -> retry: executeWithRetry(request)
+activate retry
+retry -> retry: attempt = 1
+retry -> service: execute(request)
+activate service
+service --> retry: ❌ TimeoutException
+deactivate service
+retry -> retry: isRetryable(TimeoutException)
+retry -> retry: ✅ yes, can retry
+retry -> backoff: calculateDelay(attempt=1)
+activate backoff
+backoff -> backoff: baseDelay = 1s * 2^(1-1) = 1s
+backoff -> backoff: jitter = random(-0.1, +0.1) = -0.05
+backoff -> backoff: finalDelay = 1s * (1 - 0.05) = 0.95s
+backoff --> retry: delay = 0.95s
+deactivate backoff
+retry -> retry: sleep(0.95s)
+
+note right of retry
+  Tentativa 1 falhou:
+  - Exceção: TimeoutException (retryable)
+  - Delay: 0.95s (1s com jitter -5%)
+  - Tentativas restantes: 4
+end note
+
+== Tentativa 2 (Falha) ==
+
+retry -> retry: attempt = 2
+retry -> service: execute(request)
+activate service
+service --> retry: ❌ ServiceUnavailableException
+deactivate service
+retry -> retry: isRetryable(ServiceUnavailableException)
+retry -> retry: ✅ yes, can retry
+retry -> backoff: calculateDelay(attempt=2)
+activate backoff
+backoff -> backoff: baseDelay = 1s * 2^(2-1) = 2s
+backoff -> backoff: jitter = random(-0.1, +0.1) = +0.08
+backoff -> backoff: finalDelay = 2s * (1 + 0.08) = 2.16s
+backoff --> retry: delay = 2.16s
+deactivate backoff
+retry -> retry: sleep(2.16s)
+
+note right of retry
+  Tentativa 2 falhou:
+  - Exceção: ServiceUnavailableException
+  - Delay: 2.16s (2s com jitter +8%)
+  - Tentativas restantes: 3
+  - Backoff exponencial: 1s → 2s
+end note
+
+== Tentativa 3 (Falha) ==
+
+retry -> retry: attempt = 3
+retry -> service: execute(request)
+activate service
+service --> retry: ❌ TimeoutException
+deactivate service
+retry -> backoff: calculateDelay(attempt=3)
+activate backoff
+backoff -> backoff: baseDelay = 1s * 2^(3-1) = 4s
+backoff -> backoff: jitter = random(-0.1, +0.1) = -0.03
+backoff -> backoff: finalDelay = 4s * (1 - 0.03) = 3.88s
+backoff --> retry: delay = 3.88s
+deactivate backoff
+retry -> retry: sleep(3.88s)
+
+note right of retry
+  Tentativa 3 falhou:
+  - Delay: 3.88s (4s com jitter -3%)
+  - Tentativas restantes: 2
+  - Progressão: 1s → 2s → 4s
+end note
+
+== Tentativa 4 (Falha) ==
+
+retry -> retry: attempt = 4
+retry -> service: execute(request)
+activate service
+service --> retry: ❌ TimeoutException
+deactivate service
+retry -> backoff: calculateDelay(attempt=4)
+activate backoff
+backoff -> backoff: baseDelay = 1s * 2^(4-1) = 8s
+backoff -> backoff: jitter = random(-0.1, +0.1) = +0.06
+backoff -> backoff: finalDelay = 8s * (1 + 0.06) = 8.48s
+backoff --> retry: delay = 8.48s
+deactivate backoff
+retry -> retry: sleep(8.48s)
+
+note right of retry
+  Tentativa 4 falhou:
+  - Delay: 8.48s (8s com jitter +6%)
+  - Tentativas restantes: 1 (última!)
+  - Progressão: 1s → 2s → 4s → 8s
+end note
+
+== Tentativa 5 (Sucesso) ==
+
+retry -> retry: attempt = 5 (última)
+retry -> service: execute(request)
+activate service
+service --> retry: ✅ response (success)
+deactivate service
+retry -> retry: success! no more retries needed
+retry --> client: response
+deactivate retry
+
+note right of retry
+  Tentativa 5 bem-sucedida! ✅
+  - Total de tentativas: 5
+  - Total de falhas: 4
+  - Tempo total: ~0.95s + 2.16s + 3.88s + 8.48s
+                 = ~15.47s
+  - Serviço recuperou na última tentativa
+end note
+
+== Cenário Alternativo: Todas as Tentativas Falharam ==
+
+group Falha Permanente
+  client -> retry: executeWithRetry(request)
+  activate retry
+  
+  loop 5 tentativas
+    retry -> service: execute(request)
+    activate service
+    service --> retry: ❌ TimeoutException
+    deactivate service
+    retry -> backoff: calculateDelay(attempt)
+    backoff --> retry: delay
+    retry -> retry: sleep(delay)
+  end
+  
+  retry -> retry: maxAttempts reached
+  retry -> retry: recordFailure()
+  retry --> client: ❌ RetryExhaustedException\n(wrapped: TimeoutException)
+  deactivate retry
+  
+  note right of retry
+    Todas as tentativas falharam:
+    - Tentativas: 5/5
+    - Exceção original: TimeoutException
+    - Exceção final: RetryExhaustedException
+    - Cliente deve tratar erro
+  end note
+end
+
+== Cenário: Exceção Não-Retryable ==
+
+group Non-Retryable Exception
+  client -> retry: executeWithRetry(request)
+  activate retry
+  retry -> retry: attempt = 1
+  retry -> service: execute(request)
+  activate service
+  service --> retry: ❌ ValidationException
+  deactivate service
+  retry -> retry: isRetryable(ValidationException)
+  retry -> retry: ❌ no, don't retry
+  retry --> client: ❌ ValidationException\n(propagated immediately)
+  deactivate retry
+  
+  note right of retry
+    Exceção não-retryable:
+    - ValidationException: erro de input
+    - Não adianta retry (erro permanente)
+    - Propagado imediatamente
+    - Economiza tempo e recursos
+  end note
+end
+
+== Métricas e Observabilidade ==
+
+retry -> retry: recordMetrics()
+note right of retry
+  Métricas Registradas:
+  - retry.attempts.total
+  - retry.attempts.failed
+  - retry.attempts.succeeded
+  - retry.exhausted (todas falharam)
+  - retry.delay.total (tempo esperando)
+  - retry.success.after.retry
+  - retry.by.exception.type
+  
+  Logs:
+  - Cada tentativa com timestamp
+  - Delay calculado
+  - Exceção capturada
+  - Jitter aplicado
+end note
+
+== Estratégias de Backoff (Comparação) ==
+
+note over backoff
+  **Fixed Delay:**
+  - 1s, 1s, 1s, 1s, 1s
+  - Simples, mas pode sobrecarregar
+  
+  **Linear Backoff:**
+  - 1s, 2s, 3s, 4s, 5s
+  - Progressão aritmética
+  
+  **Exponencial Backoff:**
+  - 1s, 2s, 4s, 8s, 16s
+  - Progressão geométrica (recomendado)
+  
+  **Exponencial com Jitter:**
+  - 0.95s, 2.16s, 3.88s, 8.48s, 14.24s
+  - Evita thundering herd
+  - Distribui carga no tempo
+  
+  **Exponencial com Max Delay:**
+  - 1s, 2s, 4s, 8s, 16s → limitado a 30s
+  - 1s, 2s, 4s, 8s, 16s, 30s, 30s, 30s
+  - Previne delays excessivos
+end note
+
+@enduml

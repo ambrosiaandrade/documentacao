@@ -1,0 +1,613 @@
+@startuml Strategy Pattern - Payment Discount Strategies
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Strategy Pattern - Runtime Algorithm Selection
+
+actor Cliente as client
+participant "ShoppingCart" as cart
+participant "DiscountStrategy\n(Interface)" as strategy_interface
+participant "NoDiscount\nStrategy" as no_discount
+participant "Percentage\nDiscount" as percentage
+participant "Fixed\nAmount" as fixed_amount
+participant "VIP\nTiered" as vip_tiered
+
+== Strategy Pattern Setup ==
+
+note over strategy_interface
+  **Strategy Interface:**
+  ```java
+  public interface DiscountStrategy {
+    Money calculateDiscount(
+      ShoppingCart cart
+    );
+    
+    String getDescription();
+    
+    boolean isApplicable(
+      Customer customer
+    );
+  }
+  ```
+  
+  **Strategy Pattern:**
+  - Define família de algoritmos
+  - Encapsula cada um
+  - Torna intercambiáveis
+  - Algoritmo varia independente dos clientes
+end note
+
+note over no_discount, vip_tiered
+  **Concrete Strategies:**
+  
+  ```java
+  public class NoDiscountStrategy 
+    implements DiscountStrategy {
+    public Money calculateDiscount(
+      ShoppingCart cart
+    ) {
+      return Money.ZERO;
+    }
+  }
+  
+  public class PercentageDiscount 
+    implements DiscountStrategy {
+    private final int percent;
+    
+    public Money calculateDiscount(
+      ShoppingCart cart
+    ) {
+      return cart.getSubtotal()
+        .multiply(percent / 100.0);
+    }
+  }
+  ```
+end note
+
+== Scenario 1: Regular Customer (No Discount) ==
+
+client -> cart: new ShoppingCart(\n  customer: regularCustomer)
+activate client
+activate cart
+
+cart -> cart: this.customer = regularCustomer
+cart -> cart: this.items = []
+cart -> cart: this.strategy = null
+
+cart --> client: ShoppingCart instance
+deactivate cart
+
+client -> cart: addItem("Product A", qty: 2, price: 50.00)
+activate cart
+cart -> cart: items.add(new CartItem(...))
+cart -> cart: subtotal = 100.00
+cart --> client: item added
+deactivate cart
+
+client -> cart: addItem("Product B", qty: 1, price: 30.00)
+activate cart
+cart -> cart: items.add(new CartItem(...))
+cart -> cart: subtotal = 130.00
+cart --> client: item added
+deactivate cart
+
+client -> cart: selectDiscountStrategy()
+activate cart
+
+cart -> cart: determineStrategy(customer)
+
+note right of cart
+  **Strategy Selection Logic:**
+  ```java
+  private DiscountStrategy 
+    determineStrategy(Customer customer) {
+    
+    if (customer.isVIP()) {
+      return new VIPTieredDiscount(
+        customer.getTier()
+      );
+    }
+    
+    if (customer.hasPromoCode()) {
+      return new PromoCodeDiscount(
+        customer.getPromoCode()
+      );
+    }
+    
+    if (cart.getSubtotal().isGreaterThan(100)) {
+      return new PercentageDiscount(10);
+    }
+    
+    return new NoDiscountStrategy();
+  }
+  ```
+  
+  **Runtime Selection!**
+end note
+
+cart -> no_discount: new NoDiscountStrategy()
+activate no_discount
+no_discount --> cart: strategy instance
+deactivate no_discount
+
+cart -> cart: this.strategy = NoDiscountStrategy
+
+cart --> client: strategy selected
+deactivate cart
+
+client -> cart: calculateTotal()
+activate cart
+
+cart -> cart: subtotal = 130.00
+
+cart -> strategy_interface: calculateDiscount(cart)
+activate strategy_interface
+
+strategy_interface -> no_discount: calculateDiscount(cart)
+activate no_discount
+
+no_discount -> no_discount: return Money.ZERO
+
+no_discount --> strategy_interface: discount = 0.00
+deactivate no_discount
+
+strategy_interface --> cart: discount = 0.00
+deactivate strategy_interface
+
+cart -> cart: total = subtotal - discount\n      = 130.00 - 0.00\n      = 130.00
+
+cart --> client: total = 130.00,\ndiscount = 0.00,\ndescription = "No discount"
+deactivate cart
+
+note right of client
+  **Regular Customer:**
+  - Subtotal: $130.00
+  - Discount: $0.00
+  - Total: $130.00
+end note
+
+== Scenario 2: Bulk Purchase (Percentage Discount) ==
+
+client -> cart: new ShoppingCart(\n  customer: regularCustomer)
+activate cart
+cart --> client: ShoppingCart
+deactivate cart
+
+client -> cart: addItem("Product A", qty: 5, price: 50.00)
+activate cart
+cart -> cart: subtotal = 250.00
+cart --> client: item added
+deactivate cart
+
+client -> cart: selectDiscountStrategy()
+activate cart
+
+cart -> cart: determineStrategy(customer)
+cart -> cart: subtotal > 100?\n  YES → 10% discount
+
+cart -> percentage: new PercentageDiscount(10)
+activate percentage
+percentage --> cart: strategy instance
+deactivate percentage
+
+cart -> cart: this.strategy = PercentageDiscount(10%)
+
+cart --> client: strategy selected
+deactivate cart
+
+client -> cart: calculateTotal()
+activate cart
+
+cart -> cart: subtotal = 250.00
+
+cart -> strategy_interface: calculateDiscount(cart)
+activate strategy_interface
+
+strategy_interface -> percentage: calculateDiscount(cart)
+activate percentage
+
+percentage -> percentage: discount = 250.00 * 0.10\n          = 25.00
+
+percentage --> strategy_interface: discount = 25.00
+deactivate percentage
+
+strategy_interface --> cart: discount = 25.00
+deactivate strategy_interface
+
+cart -> cart: total = 250.00 - 25.00 = 225.00
+
+cart --> client: total = 225.00,\ndiscount = 25.00,\ndescription = "10% bulk discount"
+deactivate cart
+
+note right of client
+  **Bulk Purchase:**
+  - Subtotal: $250.00
+  - Discount: $25.00 (10%)
+  - Total: $225.00
+  
+  **Different strategy applied!**
+end note
+
+== Scenario 3: VIP Customer (Tiered Discount) ==
+
+client -> cart: new ShoppingCart(\n  customer: vipCustomer)
+activate cart
+cart --> client: ShoppingCart
+deactivate cart
+
+client -> cart: addItem("Product A", qty: 3, price: 100.00)
+activate cart
+cart -> cart: subtotal = 300.00
+cart --> client: item added
+deactivate cart
+
+client -> cart: selectDiscountStrategy()
+activate cart
+
+cart -> cart: determineStrategy(vipCustomer)
+cart -> cart: customer.isVIP()? YES
+
+cart -> vip_tiered: new VIPTieredDiscount(\n  tier: customer.getVIPTier())
+activate vip_tiered
+
+vip_tiered -> vip_tiered: this.tier = GOLD\n(customer's tier)
+
+vip_tiered --> cart: strategy instance
+deactivate vip_tiered
+
+cart -> cart: this.strategy = VIPTieredDiscount
+
+cart --> client: strategy selected
+deactivate cart
+
+client -> cart: calculateTotal()
+activate cart
+
+cart -> cart: subtotal = 300.00
+
+cart -> strategy_interface: calculateDiscount(cart)
+activate strategy_interface
+
+strategy_interface -> vip_tiered: calculateDiscount(cart)
+activate vip_tiered
+
+vip_tiered -> vip_tiered: switch (tier)
+
+note right of vip_tiered
+  **VIP Tiered Strategy:**
+  ```java
+  public class VIPTieredDiscount 
+    implements DiscountStrategy {
+    
+    private final VIPTier tier;
+    
+    public Money calculateDiscount(
+      ShoppingCart cart
+    ) {
+      Money subtotal = cart.getSubtotal();
+      
+      return switch (tier) {
+        case BRONZE -> subtotal.multiply(0.05);
+        case SILVER -> subtotal.multiply(0.10);
+        case GOLD   -> subtotal.multiply(0.15);
+        case PLATINUM -> subtotal.multiply(0.20);
+      };
+    }
+  }
+  ```
+  
+  **Complex Logic Encapsulated!**
+end note
+
+vip_tiered -> vip_tiered: tier == GOLD\ndiscount = 300.00 * 0.15 = 45.00
+
+vip_tiered --> strategy_interface: discount = 45.00
+deactivate vip_tiered
+
+strategy_interface --> cart: discount = 45.00
+deactivate strategy_interface
+
+cart -> cart: total = 300.00 - 45.00 = 255.00
+
+cart --> client: total = 255.00,\ndiscount = 45.00,\ndescription = "VIP Gold 15% discount"
+deactivate cart
+
+note right of client
+  **VIP Customer (Gold):**
+  - Subtotal: $300.00
+  - Discount: $45.00 (15%)
+  - Total: $255.00
+  
+  **Complex tiered logic hidden!**
+end note
+
+== Changing Strategy at Runtime ==
+
+client -> cart: setDiscountStrategy(\n  new FixedAmountDiscount(50.00))
+activate cart
+
+cart -> fixed_amount: new FixedAmountDiscount(50.00)
+activate fixed_amount
+fixed_amount --> cart: strategy instance
+deactivate fixed_amount
+
+cart -> cart: this.strategy = FixedAmountDiscount
+
+cart --> client: strategy changed
+deactivate cart
+
+note right of cart
+  **Runtime Strategy Change:**
+  - Strategy can be changed dynamically
+  - No need to recreate cart
+  - Flexible
+  
+  ```java
+  public void setDiscountStrategy(
+    DiscountStrategy strategy
+  ) {
+    this.strategy = strategy;
+  }
+  ```
+end note
+
+client -> cart: calculateTotal()
+activate cart
+
+cart -> cart: subtotal = 300.00
+
+cart -> strategy_interface: calculateDiscount(cart)
+activate strategy_interface
+
+strategy_interface -> fixed_amount: calculateDiscount(cart)
+activate fixed_amount
+
+fixed_amount -> fixed_amount: return Money.of(50.00)
+
+fixed_amount --> strategy_interface: discount = 50.00
+deactivate fixed_amount
+
+strategy_interface --> cart: discount = 50.00
+deactivate strategy_interface
+
+cart -> cart: total = 300.00 - 50.00 = 250.00
+
+cart --> client: total = 250.00,\ndiscount = 50.00,\ndescription = "$50 fixed discount"
+deactivate cart
+
+note right of client
+  **After Strategy Change:**
+  - Same subtotal: $300.00
+  - New discount: $50.00 (fixed)
+  - New total: $250.00
+  
+  **Algorithm swapped at runtime! 🎉**
+end note
+
+== Strategy with Dependency Injection ==
+
+participant "DiscountService" as discount_service
+participant "Config" as config
+
+client -> discount_service: calculateDiscount(\n  cart,\n  customer)
+activate client
+activate discount_service
+
+discount_service -> config: getActivePromotion()
+activate config
+config --> discount_service: promotion = "BLACKFRIDAY"
+deactivate config
+
+discount_service -> discount_service: selectStrategy(promotion)
+
+note right of discount_service
+  **Strategy Factory:**
+  ```java
+  @Service
+  public class DiscountService {
+    
+    private final Map<String, DiscountStrategy> 
+      strategies;
+    
+    public DiscountService(
+      List<DiscountStrategy> strategyList
+    ) {
+      this.strategies = strategyList.stream()
+        .collect(Collectors.toMap(
+          DiscountStrategy::getName,
+          Function.identity()
+        ));
+    }
+    
+    public Money calculateDiscount(
+      ShoppingCart cart,
+      Customer customer
+    ) {
+      String promotion = 
+        config.getActivePromotion();
+      
+      DiscountStrategy strategy = 
+        strategies.get(promotion);
+      
+      return strategy.calculateDiscount(cart);
+    }
+  }
+  ```
+  
+  **Spring DI auto-discovers all strategies!**
+end note
+
+discount_service -> strategy_interface: strategies.get("BLACKFRIDAY")
+activate strategy_interface
+
+strategy_interface --> discount_service: BlackFridayStrategy
+deactivate strategy_interface
+
+discount_service -> strategy_interface: calculateDiscount(cart)
+activate strategy_interface
+strategy_interface --> discount_service: discount = 60.00\n(20% Black Friday)
+deactivate strategy_interface
+
+discount_service --> client: discount = 60.00
+deactivate discount_service
+
+deactivate client
+
+== Testing Strategies ==
+
+participant "DiscountStrategyTest" as test
+
+test -> percentage: new PercentageDiscount(10)
+activate test
+activate percentage
+percentage --> test: strategy
+deactivate percentage
+
+test -> cart: new ShoppingCart()
+activate cart
+cart --> test: cart with subtotal 100.00
+deactivate cart
+
+test -> percentage: calculateDiscount(cart)
+activate percentage
+percentage -> percentage: 100.00 * 0.10 = 10.00
+percentage --> test: discount = 10.00
+deactivate percentage
+
+test -> test: assertThat(discount)\n  .isEqualTo(10.00)
+
+test --> test: ✅ Test Passed
+deactivate test
+
+note right of test
+  **Easy to Test:**
+  - Each strategy isolated
+  - No dependencies
+  - Pure functions
+  - Fast unit tests
+  
+  ```java
+  @Test
+  void percentageDiscountTest() {
+    DiscountStrategy strategy = 
+      new PercentageDiscount(10);
+    
+    ShoppingCart cart = 
+      new ShoppingCart();
+    cart.addItem("Product", 1, 100.00);
+    
+    Money discount = 
+      strategy.calculateDiscount(cart);
+    
+    assertThat(discount.getAmount())
+      .isEqualTo(10.00);
+  }
+  ```
+end note
+
+== Benefits & Comparison ==
+
+note over strategy_interface, vip_tiered
+  **Benefits:**
+  
+  ✅ **Open/Closed Principle:**
+  - Add new strategies without changing existing code
+  - New PromotionStrategy? Just implement interface!
+  
+  ✅ **Single Responsibility:**
+  - Each strategy has one job
+  - Discount logic encapsulated
+  - Easy to maintain
+  
+  ✅ **Runtime Flexibility:**
+  - Change algorithm dynamically
+  - Configuration-driven
+  - A/B testing friendly
+  
+  ✅ **Testability:**
+  - Test each strategy independently
+  - Mock strategies easily
+  - Isolated unit tests
+  
+  **Without Strategy (Conditional Hell):**
+  
+  ```java
+  public Money calculateDiscount(
+    ShoppingCart cart,
+    Customer customer
+  ) {
+    // ❌ Violates Open/Closed
+    // ❌ Hard to test
+    // ❌ Hard to maintain
+    
+    if (customer.isVIP()) {
+      if (customer.getTier() == GOLD) {
+        return cart.getSubtotal().multiply(0.15);
+      } else if (customer.getTier() == SILVER) {
+        return cart.getSubtotal().multiply(0.10);
+      } else if (customer.getTier() == BRONZE) {
+        return cart.getSubtotal().multiply(0.05);
+      }
+    } else if (customer.hasPromoCode()) {
+      PromoCode promo = customer.getPromoCode();
+      if (promo.isPercentage()) {
+        return cart.getSubtotal()
+          .multiply(promo.getPercentage() / 100.0);
+      } else {
+        return Money.of(promo.getFixedAmount());
+      }
+    } else if (cart.getSubtotal().isGreaterThan(100)) {
+      return cart.getSubtotal().multiply(0.10);
+    } else {
+      return Money.ZERO;
+    }
+    
+    // 😱 Nightmare to maintain!
+  }
+  ```
+  
+  **With Strategy:**
+  
+  ```java
+  public Money calculateDiscount(
+    ShoppingCart cart,
+    Customer customer
+  ) {
+    // ✅ Clean
+    // ✅ Testable
+    // ✅ Extensible
+    
+    DiscountStrategy strategy = 
+      determineStrategy(customer);
+    
+    return strategy.calculateDiscount(cart);
+    
+    // 😊 Beautiful!
+  }
+  ```
+  
+  **Use Cases:**
+  
+  - **Discount/Pricing Strategies:** (this example)
+  - **Sorting Algorithms:** QuickSort, MergeSort, BubbleSort
+  - **Compression:** ZIP, GZIP, TAR
+  - **Payment Methods:** CreditCard, PayPal, Pix
+  - **Validation Rules:** Email, Phone, CPF
+  - **Export Formats:** PDF, Excel, CSV
+  - **Routing Algorithms:** Shortest path, fastest, cheapest
+  - **Recommendation Engines:** Collaborative, content-based
+  
+  **When to Use:**
+  - Multiple algorithms for same task
+  - Need to switch at runtime
+  - Conditional logic complex
+  - Want to test algorithms independently
+  
+  **When NOT to Use:**
+  - Only one algorithm
+  - Algorithm never changes
+  - Simple if/else sufficient
+end note
+
+@enduml

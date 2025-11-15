@@ -1,0 +1,365 @@
+@startuml Saga Pattern - Orchestration
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam BoxPadding 10
+
+title Saga Pattern - Orquestração com Compensação
+
+actor Cliente as client
+participant "Order Service\n(Orchestrator)" as orchestrator
+database "Saga Log\n(Postgres)" as sagalog
+participant "Payment\nService" as payment
+participant "Inventory\nService" as inventory
+participant "Shipping\nService" as shipping
+queue "Event Bus\n(Kafka)" as kafka
+
+== Happy Path: Compra Bem-Sucedida ==
+
+client -> orchestrator: createOrder(request)
+activate orchestrator
+
+orchestrator -> sagalog: createSagaLog(sagaId, STARTED)
+activate sagalog
+sagalog --> orchestrator: sagaLog created
+deactivate sagalog
+
+note right of orchestrator
+  Saga ID: saga-123
+  Status: STARTED
+  Steps: []
+end note
+
+orchestrator -> kafka: publish(OrderCreated)
+kafka --> orchestrator: ack
+
+== Step 1: Process Payment ==
+
+orchestrator -> sagalog: addStep(PAYMENT_PROCESSING)
+orchestrator -> payment: processPayment(\n  customerId,\n  amount,\n  idempotencyKey)
+activate payment
+payment -> payment: validate card
+payment -> payment: charge amount
+payment -> payment: save payment record
+payment --> orchestrator: PaymentResponse(\n  paymentId: pay-456,\n  status: APPROVED)
+deactivate payment
+
+orchestrator -> sagalog: addStep(PAYMENT_COMPLETED,\n  paymentId: pay-456)
+orchestrator -> kafka: publish(PaymentProcessed)
+
+note right of orchestrator
+  Step 1 ✅ Completed:
+  - Payment ID: pay-456
+  - Status: APPROVED
+  - Compensation: refundPayment(pay-456)
+end note
+
+== Step 2: Reserve Inventory ==
+
+orchestrator -> sagalog: addStep(INVENTORY_RESERVING)
+orchestrator -> inventory: reserveStock(\n  items,\n  idempotencyKey)
+activate inventory
+inventory -> inventory: check availability
+inventory -> inventory: create reservation
+inventory -> inventory: decrement stock
+inventory --> orchestrator: InventoryResponse(\n  reservationId: res-789,\n  status: RESERVED)
+deactivate inventory
+
+orchestrator -> sagalog: addStep(INVENTORY_RESERVED,\n  reservationId: res-789)
+orchestrator -> kafka: publish(InventoryReserved)
+
+note right of orchestrator
+  Step 2 ✅ Completed:
+  - Reservation ID: res-789
+  - Status: RESERVED
+  - Compensation: releaseStock(res-789)
+end note
+
+== Step 3: Create Shipment ==
+
+orchestrator -> sagalog: addStep(SHIPPING_CREATING)
+orchestrator -> shipping: createShipment(\n  address,\n  items,\n  idempotencyKey)
+activate shipping
+shipping -> shipping: validate address
+shipping -> shipping: calculate shipping cost
+shipping -> shipping: create shipment record
+shipping --> orchestrator: ShippingResponse(\n  shipmentId: ship-321,\n  status: CREATED)
+deactivate shipping
+
+orchestrator -> sagalog: addStep(SHIPPING_CREATED,\n  shipmentId: ship-321)
+orchestrator -> kafka: publish(ShipmentCreated)
+
+note right of orchestrator
+  Step 3 ✅ Completed:
+  - Shipment ID: ship-321
+  - Status: CREATED
+  - Compensation: cancelShipment(ship-321)
+end note
+
+== Saga Completed ==
+
+orchestrator -> sagalog: updateStatus(COMPLETED)
+activate sagalog
+sagalog --> orchestrator: updated
+deactivate sagalog
+
+orchestrator -> kafka: publish(OrderCompleted)
+orchestrator --> client: OrderResult(\n  orderId: order-123,\n  status: COMPLETED,\n  paymentId: pay-456,\n  reservationId: res-789,\n  shipmentId: ship-321)
+deactivate orchestrator
+
+note right of orchestrator
+  Saga Concluída! ✅
+  - Todas as 3 etapas bem-sucedidas
+  - Consistência alcançada
+  - Nenhuma compensação necessária
+end note
+
+== Error Path: Falha no Shipping (Compensação) ==
+
+client -> orchestrator: createOrder(request)
+activate orchestrator
+
+orchestrator -> sagalog: createSagaLog(sagaId, STARTED)
+orchestrator -> kafka: publish(OrderCreated)
+
+== Step 1: Payment (Success) ==
+
+orchestrator -> sagalog: addStep(PAYMENT_PROCESSING)
+orchestrator -> payment: processPayment()
+activate payment
+payment --> orchestrator: PaymentResponse(\n  paymentId: pay-999,\n  status: APPROVED)
+deactivate payment
+orchestrator -> sagalog: addStep(PAYMENT_COMPLETED,\n  paymentId: pay-999)
+orchestrator -> kafka: publish(PaymentProcessed)
+
+== Step 2: Inventory (Success) ==
+
+orchestrator -> sagalog: addStep(INVENTORY_RESERVING)
+orchestrator -> inventory: reserveStock()
+activate inventory
+inventory --> orchestrator: InventoryResponse(\n  reservationId: res-888,\n  status: RESERVED)
+deactivate inventory
+orchestrator -> sagalog: addStep(INVENTORY_RESERVED,\n  reservationId: res-888)
+orchestrator -> kafka: publish(InventoryReserved)
+
+== Step 3: Shipping (FAIL) ==
+
+orchestrator -> sagalog: addStep(SHIPPING_CREATING)
+orchestrator -> shipping: createShipment()
+activate shipping
+shipping -> shipping: validate address
+shipping -> shipping: ❌ address not serviceable
+shipping --> orchestrator: ❌ ShippingException(\n  "Address not in delivery area")
+deactivate shipping
+
+orchestrator -> sagalog: addStep(SHIPPING_FAILED,\n  error: "Address not serviceable")
+
+note right of orchestrator
+  Step 3 ❌ FAILED!
+  - Erro: Address not serviceable
+  - Decisão: COMPENSATE
+  - Rollback steps 2 e 1
+end note
+
+== Compensation Phase ==
+
+orchestrator -> sagalog: updateStatus(COMPENSATING)
+orchestrator -> kafka: publish(OrderFailed)
+
+note right of orchestrator
+  Iniciando Compensação:
+  - Ordem REVERSA de execução
+  - Step 3: não precisa (não executou)
+  - Step 2: releaseStock(res-888)
+  - Step 1: refundPayment(pay-999)
+end note
+
+== Compensate Step 2: Release Inventory ==
+
+orchestrator -> sagalog: addStep(COMPENSATING_INVENTORY)
+orchestrator -> inventory: releaseStock(\n  reservationId: res-888,\n  idempotencyKey)
+activate inventory
+inventory -> inventory: find reservation
+inventory -> inventory: check if already released
+inventory -> inventory: increment stock
+inventory -> inventory: delete reservation
+inventory --> orchestrator: ✅ released
+deactivate inventory
+
+orchestrator -> sagalog: addStep(INVENTORY_RELEASED)
+orchestrator -> kafka: publish(InventoryReleased)
+
+note right of orchestrator
+  Compensação 2 ✅:
+  - Estoque devolvido
+  - Reserva cancelada
+end note
+
+== Compensate Step 1: Refund Payment ==
+
+orchestrator -> sagalog: addStep(COMPENSATING_PAYMENT)
+orchestrator -> payment: refundPayment(\n  paymentId: pay-999,\n  idempotencyKey)
+activate payment
+payment -> payment: find payment
+payment -> payment: check if already refunded
+payment -> payment: process refund
+payment -> payment: update status to REFUNDED
+payment --> orchestrator: ✅ refunded
+deactivate payment
+
+orchestrator -> sagalog: addStep(PAYMENT_REFUNDED)
+orchestrator -> kafka: publish(PaymentRefunded)
+
+note right of orchestrator
+  Compensação 1 ✅:
+  - Pagamento estornado
+  - Cliente não cobrado
+end note
+
+== Saga Failed (After Successful Compensation) ==
+
+orchestrator -> sagalog: updateStatus(FAILED)
+activate sagalog
+sagalog --> orchestrator: updated
+deactivate sagalog
+
+orchestrator -> kafka: publish(OrderCompensated)
+orchestrator --> client: ❌ OrderResult(\n  orderId: order-456,\n  status: FAILED,\n  error: "Address not serviceable",\n  compensated: true)
+deactivate orchestrator
+
+note right of orchestrator
+  Saga Falhou ❌ (Compensado ✅):
+  - Erro: Shipping não disponível
+  - Compensações bem-sucedidas
+  - Consistência restaurada
+  - Cliente informado do erro
+end note
+
+== Worst Case: Compensation Failure ==
+
+group Falha na Compensação (Cenário Crítico)
+  client -> orchestrator: createOrder(request)
+  activate orchestrator
+  
+  orchestrator -> sagalog: createSagaLog(sagaId, STARTED)
+  
+  ' Payment e Inventory executam com sucesso
+  orchestrator -> payment: processPayment()
+  activate payment
+  payment --> orchestrator: success (paymentId: pay-111)
+  deactivate payment
+  orchestrator -> sagalog: addStep(PAYMENT_COMPLETED, pay-111)
+  
+  orchestrator -> inventory: reserveStock()
+  activate inventory
+  inventory --> orchestrator: success (reservationId: res-222)
+  deactivate inventory
+  orchestrator -> sagalog: addStep(INVENTORY_RESERVED, res-222)
+  
+  ' Shipping falha
+  orchestrator -> shipping: createShipment()
+  activate shipping
+  shipping --> orchestrator: ❌ failure
+  deactivate shipping
+  
+  orchestrator -> sagalog: updateStatus(COMPENSATING)
+  
+  ' Compensação do Inventory funciona
+  orchestrator -> inventory: releaseStock(res-222)
+  activate inventory
+  inventory --> orchestrator: ✅ released
+  deactivate inventory
+  orchestrator -> sagalog: addStep(INVENTORY_RELEASED)
+  
+  ' Compensação do Payment FALHA (CRÍTICO!)
+  orchestrator -> payment: refundPayment(pay-111)
+  activate payment
+  payment -> payment: try to refund
+  payment --> orchestrator: ❌ RefundException(\n  "Payment gateway down")
+  deactivate payment
+  
+  orchestrator -> sagalog: addStep(PAYMENT_REFUND_FAILED,\n  error: "Payment gateway down")
+  
+  note right of orchestrator
+    ⚠️ COMPENSAÇÃO FALHOU! ⚠️
+    - Pagamento NÃO estornado
+    - Gateway indisponível
+    - AÇÃO MANUAL NECESSÁRIA
+    
+    Ações Automáticas:
+    1. Log crítico com sagaId
+    2. Alerta PagerDuty/Opsgenie
+    3. Enviar para Dead Letter Queue
+    4. Retry agendado (exponential backoff)
+    5. Ticket criado (JIRA/ServiceNow)
+  end note
+  
+  orchestrator -> sagalog: updateStatus(COMPENSATION_FAILED)
+  orchestrator -> kafka: publish(CompensationFailed,\n  severity: CRITICAL)
+  orchestrator -> orchestrator: sendAlert(\n  "MANUAL INTERVENTION REQUIRED")
+  orchestrator -> kafka: sendToDeadLetterQueue(\n  sagaId, paymentId, error)
+  
+  orchestrator --> client: ❌ OrderResult(\n  status: COMPENSATION_FAILED,\n  message: "Order failed, refund pending")
+  deactivate orchestrator
+  
+  note right of client
+    Cliente recebe:
+    - Pedido falhou
+    - Reembolso será processado
+    - Equipe notificada
+    - Acompanhamento via ticket
+  end note
+end
+
+== Saga Log Structure ==
+
+note over sagalog
+  **Saga Log (Postgres - JSONB):**
+  {
+    "sagaId": "saga-123",
+    "status": "COMPLETED",
+    "createdAt": "2025-11-15T10:00:00Z",
+    "updatedAt": "2025-11-15T10:00:45Z",
+    "steps": [
+      {"step": "PAYMENT_PROCESSING", "timestamp": "..."},
+      {"step": "PAYMENT_COMPLETED", "data": {"paymentId": "pay-456"}},
+      {"step": "INVENTORY_RESERVING", "timestamp": "..."},
+      {"step": "INVENTORY_RESERVED", "data": {"reservationId": "res-789"}},
+      {"step": "SHIPPING_CREATING", "timestamp": "..."},
+      {"step": "SHIPPING_CREATED", "data": {"shipmentId": "ship-321"}}
+    ]
+  }
+  
+  **Permite:**
+  - Recuperação após crash do orchestrator
+  - Audit trail completo
+  - Debugging de falhas
+  - Métricas de duração por step
+end note
+
+== Idempotência ==
+
+note over payment, inventory, shipping
+  **Todos os serviços devem ser IDEMPOTENTES:**
+  
+  Request com Idempotency-Key:
+  - Primeira chamada: executa normalmente
+  - Chamadas repetidas: retorna resultado anterior
+  
+  Exemplo Payment Service:
+  ```
+  if (idempotencyCache.contains(key)) {
+    return cachedResponse;
+  }
+  PaymentResponse response = processPayment();
+  idempotencyCache.put(key, response, TTL=24h);
+  return response;
+  ```
+  
+  Evita:
+  - Cobranças duplicadas (retry)
+  - Reservas múltiplas
+  - Envios duplicados
+end note
+
+@enduml

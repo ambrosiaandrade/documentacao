@@ -1,0 +1,801 @@
+@startuml Decorator Pattern - Dynamic Behavior Addition
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Decorator Pattern - Service Decorators (Logging, Caching, Validation)
+
+actor Cliente as client
+participant "Controller" as controller
+participant "LoggingDecorator\n(Decorator)" as logging_decorator
+participant "CachingDecorator\n(Decorator)" as caching_decorator
+participant "ValidationDecorator\n(Decorator)" as validation_decorator
+participant "UserService\n(Component)" as user_service
+database "Cache\n(Redis)" as cache
+database "Database\n(PostgreSQL)" as database
+
+== Decorator Pattern Structure ==
+
+note over logging_decorator, validation_decorator
+  **Decorator Pattern:**
+  
+  ```java
+  // Component Interface
+  public interface UserService {
+    User getUser(String userId);
+    void updateUser(User user);
+  }
+  
+  // Concrete Component (Base)
+  @Component
+  public class UserServiceImpl 
+    implements UserService {
+    
+    @Autowired
+    private UserRepository repository;
+    
+    @Override
+    public User getUser(String userId) {
+      return repository.findById(userId)
+        .orElseThrow(() -> 
+          new UserNotFoundException(userId));
+    }
+    
+    @Override
+    public void updateUser(User user) {
+      repository.save(user);
+    }
+  }
+  
+  // Decorator Base (optional)
+  public abstract class UserServiceDecorator 
+    implements UserService {
+    
+    protected final UserService delegate;
+    
+    public UserServiceDecorator(
+      UserService delegate
+    ) {
+      this.delegate = delegate;
+    }
+    
+    // Delegates by default
+    @Override
+    public User getUser(String userId) {
+      return delegate.getUser(userId);
+    }
+    
+    @Override
+    public void updateUser(User user) {
+      delegate.updateUser(user);
+    }
+  }
+  ```
+end note
+
+== Scenario 1: Simple Call (No Decorators) ==
+
+client -> controller: GET /users/123
+activate client
+activate controller
+
+controller -> user_service: getUser("123")
+activate user_service
+
+user_service -> database: SELECT * FROM users\nWHERE id = '123'
+activate database
+
+note right of database
+  **Direct Query:**
+  - No caching
+  - No logging
+  - No validation
+end note
+
+database --> user_service: User(id=123,\n  name="John")
+deactivate database
+
+user_service --> controller: User
+deactivate user_service
+
+controller --> client: 200 OK\n{ "id": "123",\n  "name": "John" }
+deactivate controller
+deactivate client
+
+== Scenario 2: With Logging Decorator ==
+
+note over logging_decorator
+  **Logging Decorator:**
+  
+  ```java
+  public class LoggingDecorator 
+    extends UserServiceDecorator {
+    
+    private static final Logger log = 
+      LoggerFactory.getLogger(
+        LoggingDecorator.class
+      );
+    
+    @Override
+    public User getUser(String userId) {
+      log.info("Getting user: {}", userId);
+      long start = System.currentTimeMillis();
+      
+      try {
+        User user = delegate.getUser(userId);
+        long duration = 
+          System.currentTimeMillis() - start;
+        
+        log.info("User retrieved: {} in {}ms", 
+          userId, duration);
+        
+        return user;
+      } catch (Exception e) {
+        log.error("Failed to get user: {}", 
+          userId, e);
+        throw e;
+      }
+    }
+  }
+  ```
+end note
+
+client -> controller: GET /users/456
+activate client
+activate controller
+
+controller -> logging_decorator: getUser("456")
+activate logging_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "Getting user: 456")
+
+note right of logging_decorator
+  **Before Delegation:**
+  [INFO] Getting user: 456
+  [INFO] Start time: 10:30:00.000
+end note
+
+logging_decorator -> user_service: delegate.getUser("456")
+activate user_service
+
+user_service -> database: SELECT * FROM users\nWHERE id = '456'
+activate database
+database --> user_service: User(id=456)
+deactivate database
+
+user_service --> logging_decorator: User
+deactivate user_service
+
+logging_decorator -> logging_decorator: duration = 45ms\nlog.info(\n  "User retrieved: 456\n  in 45ms")
+
+note right of logging_decorator
+  **After Delegation:**
+  [INFO] User retrieved: 456 in 45ms
+  [INFO] Method: getUser
+  [INFO] Success: true
+end note
+
+logging_decorator --> controller: User
+deactivate logging_decorator
+
+controller --> client: 200 OK
+deactivate controller
+deactivate client
+
+== Scenario 3: Logging + Caching Decorators (Chaining) ==
+
+note over caching_decorator
+  **Caching Decorator:**
+  
+  ```java
+  public class CachingDecorator 
+    extends UserServiceDecorator {
+    
+    @Autowired
+    private CacheManager cacheManager;
+    
+    @Override
+    public User getUser(String userId) {
+      String cacheKey = 
+        "user:" + userId;
+      
+      // Check cache first
+      User cached = 
+        cacheManager.get(cacheKey);
+      
+      if (cached != null) {
+        return cached; // Cache hit
+      }
+      
+      // Cache miss - delegate
+      User user = delegate.getUser(userId);
+      
+      // Store in cache
+      cacheManager.put(
+        cacheKey, user, Duration.ofMinutes(5)
+      );
+      
+      return user;
+    }
+    
+    @Override
+    public void updateUser(User user) {
+      // Update database
+      delegate.updateUser(user);
+      
+      // Invalidate cache
+      String cacheKey = "user:" + user.getId();
+      cacheManager.evict(cacheKey);
+    }
+  }
+  ```
+end note
+
+client -> controller: GET /users/789
+activate client
+activate controller
+
+note right of controller
+  **Decorator Chain:**
+  Controller → Logging → Caching → UserService
+  
+  Each decorator adds behavior!
+end note
+
+controller -> logging_decorator: getUser("789")
+activate logging_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "Getting user: 789")
+
+logging_decorator -> caching_decorator: delegate.getUser("789")
+activate caching_decorator
+
+caching_decorator -> caching_decorator: cacheKey =\n  "user:789"
+
+caching_decorator -> cache: GET user:789
+activate cache
+
+note right of cache
+  **Cache Check:**
+  Key: user:789
+  Result: NULL (cache miss)
+  
+  **First request or cache expired**
+end note
+
+cache --> caching_decorator: null (cache miss)
+deactivate cache
+
+note right of caching_decorator
+  **Cache Miss:**
+  - User not in cache
+  - Need to fetch from DB
+  - Will cache result
+end note
+
+caching_decorator -> user_service: delegate.getUser("789")
+activate user_service
+
+user_service -> database: SELECT * FROM users\nWHERE id = '789'
+activate database
+database --> user_service: User(id=789,\n  name="Alice")
+deactivate database
+
+user_service --> caching_decorator: User
+deactivate user_service
+
+caching_decorator -> cache: SET user:789\n  User(789, "Alice")\n  EX 300 (5 min TTL)
+activate cache
+
+note right of cache
+  **Cache Store:**
+  Key: user:789
+  Value: {"id":"789","name":"Alice"}
+  TTL: 300 seconds (5 min)
+end note
+
+cache --> caching_decorator: OK
+deactivate cache
+
+caching_decorator --> logging_decorator: User
+deactivate caching_decorator
+
+logging_decorator -> logging_decorator: duration = 52ms\nlog.info(\n  "User retrieved: 789\n  in 52ms")
+
+logging_decorator --> controller: User
+deactivate logging_decorator
+
+controller --> client: 200 OK\n{ "id": "789",\n  "name": "Alice" }
+deactivate controller
+deactivate client
+
+note right of client
+  **First Request:**
+  - Cache miss
+  - Database queried
+  - Logged (52ms)
+  - Cached for next time
+end note
+
+== Scenario 4: Cached Request (Cache Hit) ==
+
+client -> controller: GET /users/789\n(2nd request)
+activate client
+activate controller
+
+controller -> logging_decorator: getUser("789")
+activate logging_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "Getting user: 789")
+
+logging_decorator -> caching_decorator: delegate.getUser("789")
+activate caching_decorator
+
+caching_decorator -> caching_decorator: cacheKey =\n  "user:789"
+
+caching_decorator -> cache: GET user:789
+activate cache
+
+note right of cache
+  **Cache Check:**
+  Key: user:789
+  Result: FOUND (cache hit!)
+  
+  **No database query needed!**
+end note
+
+cache --> caching_decorator: User(789, "Alice")\n(cache hit ✅)
+deactivate cache
+
+note right of caching_decorator
+  **Cache Hit:**
+  - User found in cache
+  - Return immediately
+  - NO database query
+  - Much faster!
+end note
+
+caching_decorator --> logging_decorator: User\n(from cache)
+deactivate caching_decorator
+
+note right of user_service
+  **UserService NOT Called:**
+  - Cache returned value directly
+  - Database not touched
+  - Performance win!
+end note
+
+logging_decorator -> logging_decorator: duration = 3ms\nlog.info(\n  "User retrieved: 789\n  in 3ms (cached)")
+
+logging_decorator --> controller: User
+deactivate logging_decorator
+
+controller --> client: 200 OK\n(3ms vs 52ms!)
+deactivate controller
+deactivate client
+
+note right of client
+  **Second Request:**
+  - Cache hit ✅
+  - NO database query
+  - Logged (3ms - 17x faster!)
+  - Decorator benefits visible
+end note
+
+== Scenario 5: Adding Validation Decorator ==
+
+note over validation_decorator
+  **Validation Decorator:**
+  
+  ```java
+  public class ValidationDecorator 
+    extends UserServiceDecorator {
+    
+    @Autowired
+    private Validator validator;
+    
+    @Override
+    public User getUser(String userId) {
+      // Validate input
+      if (userId == null || userId.isBlank()) {
+        throw new IllegalArgumentException(
+          "userId cannot be blank"
+        );
+      }
+      
+      if (!userId.matches("[A-Za-z0-9]{3,50}")) {
+        throw new IllegalArgumentException(
+          "Invalid userId format"
+        );
+      }
+      
+      return delegate.getUser(userId);
+    }
+    
+    @Override
+    public void updateUser(User user) {
+      // Validate entire object
+      Set<ConstraintViolation<User>> violations = 
+        validator.validate(user);
+      
+      if (!violations.isEmpty()) {
+        throw new ValidationException(
+          "Invalid user: " + 
+          violations.toString()
+        );
+      }
+      
+      delegate.updateUser(user);
+    }
+  }
+  ```
+end note
+
+client -> controller: PUT /users/999\n{ "name": "" }
+activate client
+activate controller
+
+note right of controller
+  **New Decorator Chain:**
+  Controller → Logging → Validation → 
+  Caching → UserService
+  
+  **Validation added without changing
+  existing code!**
+end note
+
+controller -> logging_decorator: updateUser(\n  User(999, ""))
+activate logging_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "Updating user: 999")
+
+logging_decorator -> validation_decorator: delegate.updateUser(\n  User(999, ""))
+activate validation_decorator
+
+validation_decorator -> validation_decorator: validate(user)\nname is blank ❌
+
+note right of validation_decorator
+  **Validation Failed:**
+  - name cannot be blank
+  - Constraints: @NotBlank, @Size(min=2)
+  - Exception thrown BEFORE delegation
+  
+  **No further decorators called!**
+end note
+
+validation_decorator --> logging_decorator: throw ValidationException(\n  "Invalid user: name blank")
+deactivate validation_decorator
+
+logging_decorator -> logging_decorator: log.error(\n  "Validation failed: 999")
+
+logging_decorator --> controller: throw ValidationException
+deactivate logging_decorator
+
+note right of caching_decorator
+  **Caching & UserService NOT Called:**
+  - Validation failed early
+  - No database call
+  - No cache invalidation
+  
+  **Fail fast!**
+end note
+
+controller --> client: 400 Bad Request\n{ "error": "name blank" }
+deactivate controller
+deactivate client
+
+== Scenario 6: Successful Update (All Decorators) ==
+
+client -> controller: PUT /users/999\n{ "name": "Bob" }
+activate client
+activate controller
+
+controller -> logging_decorator: updateUser(\n  User(999, "Bob"))
+activate logging_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "Updating user: 999")
+
+logging_decorator -> validation_decorator: delegate.updateUser(\n  User(999, "Bob"))
+activate validation_decorator
+
+validation_decorator -> validation_decorator: validate(user)\nname="Bob" ✅
+
+note right of validation_decorator
+  **Validation Passed:**
+  - name not blank
+  - Length valid (3 chars)
+  - All constraints satisfied
+end note
+
+validation_decorator -> caching_decorator: delegate.updateUser(\n  User(999, "Bob"))
+activate caching_decorator
+
+note right of caching_decorator
+  **Before Database Update:**
+  Will invalidate cache after success
+end note
+
+caching_decorator -> user_service: delegate.updateUser(\n  User(999, "Bob"))
+activate user_service
+
+user_service -> database: UPDATE users\nSET name = 'Bob'\nWHERE id = '999'
+activate database
+
+database --> user_service: 1 row updated
+deactivate database
+
+user_service --> caching_decorator: void (success)
+deactivate user_service
+
+caching_decorator -> cache: DEL user:999\n(invalidate)
+activate cache
+
+note right of cache
+  **Cache Invalidation:**
+  - User updated in DB
+  - Remove stale cache entry
+  - Next GET will fetch fresh data
+end note
+
+cache --> caching_decorator: OK
+deactivate cache
+
+caching_decorator --> validation_decorator: void
+deactivate caching_decorator
+
+validation_decorator --> logging_decorator: void
+deactivate validation_decorator
+
+logging_decorator -> logging_decorator: log.info(\n  "User updated: 999")
+
+logging_decorator --> controller: void (success)
+deactivate logging_decorator
+
+controller --> client: 204 No Content\n(updated successfully)
+deactivate controller
+deactivate client
+
+== Spring AOP Decorator ==
+
+note over logging_decorator, validation_decorator
+  **Spring AOP as Decorator:**
+  
+  ```java
+  // Aspect = Decorator
+  @Aspect
+  @Component
+  public class LoggingAspect {
+    
+    private static final Logger log = 
+      LoggerFactory.getLogger(
+        LoggingAspect.class
+      );
+    
+    @Around("@annotation(Loggable)")
+    public Object logMethod(
+      ProceedingJoinPoint joinPoint
+    ) throws Throwable {
+      String method = 
+        joinPoint.getSignature().getName();
+      Object[] args = joinPoint.getArgs();
+      
+      log.info("Calling {}: {}", method, args);
+      long start = System.currentTimeMillis();
+      
+      try {
+        Object result = joinPoint.proceed();
+        long duration = 
+          System.currentTimeMillis() - start;
+        
+        log.info("Method {} completed in {}ms", 
+          method, duration);
+        
+        return result;
+      } catch (Exception e) {
+        log.error("Method {} failed", method, e);
+        throw e;
+      }
+    }
+  }
+  
+  // Usage
+  @Service
+  public class UserServiceImpl 
+    implements UserService {
+    
+    @Loggable // AOP decorator applied!
+    @Cacheable("users") // Spring cache decorator!
+    @Validated // Validation decorator!
+    @Override
+    public User getUser(String userId) {
+      return repository.findById(userId)
+        .orElseThrow();
+    }
+  }
+  ```
+  
+  **Spring provides decorators:**
+  - @Cacheable (caching)
+  - @Transactional (transactions)
+  - @Async (async execution)
+  - @Retryable (retry logic)
+  - @CircuitBreaker (resilience)
+  - Custom @Aspect (logging, security, etc.)
+end note
+
+== Java I/O Streams (Classic Decorator) ==
+
+note over logging_decorator, user_service
+  **Java I/O Decorator Chain:**
+  
+  ```java
+  // Base component
+  InputStream fileInput = 
+    new FileInputStream("data.txt");
+  
+  // Decorator 1: Buffering
+  BufferedInputStream buffered = 
+    new BufferedInputStream(fileInput);
+  
+  // Decorator 2: Data conversion
+  DataInputStream dataInput = 
+    new DataInputStream(buffered);
+  
+  // Decorator 3: Compression
+  GZIPInputStream gzipInput = 
+    new GZIPInputStream(dataInput);
+  
+  // Chain: File → Buffer → Data → GZIP
+  // Each adds behavior!
+  
+  // Read from final decorator
+  int data = gzipInput.read();
+  
+  // Cleanup (all decorators closed)
+  gzipInput.close();
+  ```
+  
+  **Each decorator:**
+  - Wraps another InputStream
+  - Adds behavior (buffering, compression)
+  - Same interface (read(), close())
+  - Can be combined freely
+end note
+
+== Decorator vs Inheritance ==
+
+note over client, database
+  **Without Decorator (Inheritance Hell):**
+  
+  ```java
+  // Need 8 classes for 3 features! (2^3)
+  
+  UserService
+  ├── LoggingUserService
+  ├── CachingUserService
+  ├── ValidationUserService
+  ├── LoggingCachingUserService
+  ├── LoggingValidationUserService
+  ├── CachingValidationUserService
+  └── LoggingCachingValidationUserService
+  
+  // Want to add TransactionUserService?
+  // Now need 16 classes! (2^4)
+  
+  // Can't change behavior at runtime
+  // Explosion of subclasses
+  // Rigid
+  ```
+  
+  **With Decorator (Composition):**
+  
+  ```java
+  // Only 4 classes total
+  
+  UserService (interface)
+  UserServiceImpl (base)
+  LoggingDecorator
+  CachingDecorator
+  ValidationDecorator
+  
+  // Combine at runtime:
+  UserService service = 
+    new LoggingDecorator(
+      new CachingDecorator(
+        new ValidationDecorator(
+          new UserServiceImpl()
+        )
+      )
+    );
+  
+  // Want transactions?
+  // Add 1 class: TransactionDecorator
+  
+  // Flexible composition
+  // Runtime configuration
+  // Linear growth
+  ```
+  
+  **Benefits:**
+  - O(n) classes vs O(2^n) subclasses
+  - Runtime behavior change
+  - Easy to add/remove decorators
+  - Follows Open/Closed Principle
+  - Single Responsibility (each decorator one concern)
+end note
+
+== Benefits & Trade-offs ==
+
+note over logging_decorator, database
+  **Benefits:**
+  
+  ✅ **Flexible Extension:**
+  - Add behavior without modifying existing code
+  - Open/Closed Principle
+  
+  ✅ **Runtime Composition:**
+  - Configure decorator chain dynamically
+  - Different chains for different scenarios
+  
+  ✅ **Single Responsibility:**
+  - Each decorator one concern
+  - Logging, caching, validation separated
+  
+  ✅ **Avoids Inheritance:**
+  - No class explosion
+  - Composition > Inheritance
+  
+  ✅ **Transparent:**
+  - Same interface as component
+  - Client doesn't know about decorators
+  
+  **Trade-offs:**
+  
+  ⚠️ **Complexity:**
+  - Many small objects
+  - Hard to debug decorator chains
+  - Stack traces deep
+  
+  ⚠️ **Order Matters:**
+  - Logging → Caching ≠ Caching → Logging
+  - Must configure order carefully
+  
+  ⚠️ **Identity Lost:**
+  - Decorated object ≠ original object
+  - instanceof checks fail
+  - Need to unwrap decorators
+  
+  ⚠️ **Boilerplate:**
+  - Delegation code repetitive
+  - Solution: Spring AOP
+  
+  **Use Cases:**
+  
+  - **Cross-cutting Concerns:** Logging, caching, security
+  - **I/O Streams:** Buffering, compression, encryption
+  - **UI Components:** Borders, scrollbars
+  - **Middleware:** Express.js, WSGI
+  - **Proxy/Wrapper:** Add functionality transparently
+  
+  **When to Use:**
+  - Need to add responsibilities dynamically
+  - Extension by inheritance impractical
+  - Multiple independent features to combine
+  - Open/Closed Principle important
+  
+  **When NOT to Use:**
+  - Simple one-time behavior addition
+  - Performance critical (decorator overhead)
+  - Order dependency complex
+  - Simpler pattern available (Strategy, Proxy)
+  
+  **Decorator vs Proxy vs Adapter:**
+  
+  **Decorator:** Add behavior to existing object
+  **Proxy:** Control access to object
+  **Adapter:** Convert interface of object
+  
+  All use composition, different intents!
+end note
+
+@enduml

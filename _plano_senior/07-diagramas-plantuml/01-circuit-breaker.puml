@@ -1,0 +1,223 @@
+@startuml Circuit Breaker Pattern - Estados e Transições
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam BoxPadding 10
+
+title Circuit Breaker Pattern - Fluxo Completo de Estados
+
+actor Cliente as client
+participant "Circuit Breaker" as cb
+participant "Serviço\nExterno" as service
+database "Failure Counter" as counter
+database "State Store" as state
+
+== Estado CLOSED (Normal Operation) ==
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: CLOSED
+cb -> service: executeRequest()
+activate service
+service --> cb: success
+deactivate service
+cb -> counter: resetFailures()
+cb --> client: response (success)
+deactivate cb
+
+note right of cb
+  Estado CLOSED:
+  - Requisições passam normalmente
+  - Contadores resetados em sucesso
+  - Monitora falhas consecutivas
+end note
+
+== Falhas Consecutivas (CLOSED → OPEN) ==
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: CLOSED
+cb -> service: executeRequest()
+activate service
+service --> cb: ❌ TimeoutException
+deactivate service
+cb -> counter: incrementFailures()
+counter --> cb: count = 1
+cb --> client: ❌ exception (propagated)
+deactivate cb
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: CLOSED
+cb -> service: executeRequest()
+activate service
+service --> cb: ❌ ServiceUnavailable
+deactivate service
+cb -> counter: incrementFailures()
+counter --> cb: count = 2
+cb --> client: ❌ exception (propagated)
+deactivate cb
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: CLOSED
+cb -> service: executeRequest()
+activate service
+service --> cb: ❌ ConnectionException
+deactivate service
+cb -> counter: incrementFailures()
+counter --> cb: count = 3
+cb -> cb: threshold reached (3 failures)
+cb -> state: setState(OPEN)
+cb -> cb: startTimer(60s)
+cb --> client: ❌ exception (propagated)
+deactivate cb
+
+note right of cb
+  Transição CLOSED → OPEN:
+  - Falhas consecutivas >= threshold
+  - Circuit "abre" para proteger
+  - Timer iniciado (cooldown period)
+end note
+
+== Estado OPEN (Fail Fast) ==
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: OPEN
+cb -> cb: checkTimer()
+cb -> cb: timer < 60s
+cb --> client: ❌ CallNotPermittedException\n(fail fast, sem chamar serviço)
+deactivate cb
+
+note right of cb
+  Estado OPEN:
+  - Requisições rejeitadas imediatamente
+  - Serviço NÃO é chamado (fail fast)
+  - Previne sobrecarga do serviço
+  - Aguarda timer expirar
+end note
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: OPEN
+cb -> cb: checkTimer()
+cb -> cb: timer < 60s
+cb --> client: ❌ CallNotPermittedException\n(fail fast)
+deactivate cb
+
+... Após 60 segundos (timer expira) ...
+
+== Transição OPEN → HALF_OPEN ==
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: OPEN
+cb -> cb: checkTimer()
+cb -> cb: timer >= 60s ✅
+cb -> state: setState(HALF_OPEN)
+cb -> counter: resetSuccessCounter()
+note right of cb
+  Transição OPEN → HALF_OPEN:
+  - Timer expirou
+  - Permite tentativas limitadas
+  - Testa se serviço recuperou
+end note
+cb -> service: executeRequest()\n(test call)
+activate service
+service --> cb: success ✅
+deactivate service
+cb -> counter: incrementSuccesses()
+counter --> cb: successCount = 1
+cb --> client: response (success)
+deactivate cb
+
+== Estado HALF_OPEN (Testing Recovery) ==
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: HALF_OPEN
+cb -> counter: getSuccessCount()
+counter --> cb: successCount = 1
+cb -> service: executeRequest()
+activate service
+service --> cb: success ✅
+deactivate service
+cb -> counter: incrementSuccesses()
+counter --> cb: successCount = 2
+cb --> client: response (success)
+deactivate cb
+
+client -> cb: request()
+activate cb
+cb -> state: getState()
+state --> cb: HALF_OPEN
+cb -> counter: getSuccessCount()
+counter --> cb: successCount = 2
+cb -> service: executeRequest()
+activate service
+service --> cb: success ✅
+deactivate service
+cb -> counter: incrementSuccesses()
+counter --> cb: successCount = 3
+cb -> cb: success threshold reached (3 consecutive)
+cb -> state: setState(CLOSED)
+cb -> counter: reset()
+cb --> client: response (success)
+deactivate cb
+
+note right of cb
+  Transição HALF_OPEN → CLOSED:
+  - Sucessos consecutivos >= threshold
+  - Serviço considerado recuperado
+  - Circuit "fecha" novamente
+  - Operação normal restaurada
+end note
+
+== HALF_OPEN: Falha Durante Teste (→ OPEN) ==
+
+group Cenário Alternativo: Falha em HALF_OPEN
+  client -> cb: request()
+  activate cb
+  cb -> state: getState()
+  state --> cb: HALF_OPEN
+  cb -> service: executeRequest()
+  activate service
+  service --> cb: ❌ failure
+  deactivate service
+  cb -> state: setState(OPEN)
+  cb -> cb: startTimer(60s)
+  cb -> counter: reset()
+  cb --> client: ❌ exception
+  deactivate cb
+  
+  note right of cb
+    HALF_OPEN → OPEN:
+    - Qualquer falha reabre circuit
+    - Timer reiniciado
+    - Aguarda novo cooldown
+  end note
+end
+
+== Métricas e Observabilidade ==
+
+cb -> cb: recordMetrics()
+note right of cb
+  Métricas Registradas:
+  - circuit.breaker.state (CLOSED/OPEN/HALF_OPEN)
+  - circuit.breaker.calls.total
+  - circuit.breaker.calls.failed
+  - circuit.breaker.calls.not_permitted (OPEN)
+  - circuit.breaker.state.transitions
+  - circuit.breaker.failure.rate
+end note
+
+@enduml

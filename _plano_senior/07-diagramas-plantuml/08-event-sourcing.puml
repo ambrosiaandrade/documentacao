@@ -1,0 +1,501 @@
+@startuml Event Sourcing Pattern
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Event Sourcing - Complete Event History
+
+actor Cliente as client
+participant "Command\nHandler" as handler
+participant "Order\nAggregate" as aggregate
+database "Event Store\n(Append-only)" as event_store
+participant "Event\nProjector" as projector
+database "Read Model\n(Current State)" as read_model
+queue "Event Bus\n(Kafka)" as event_bus
+
+== Initial State: Empty Aggregate ==
+
+note over event_store
+  **Event Store Structure:**
+  
+  events table:
+  - event_id (UUID, PK)
+  - aggregate_id (UUID, indexed)
+  - aggregate_type (VARCHAR)
+  - event_type (VARCHAR)
+  - event_data (JSONB)
+  - event_version (INT)
+  - created_at (TIMESTAMP)
+  - metadata (JSONB)
+  
+  **Características:**
+  - Append-only (nunca UPDATE/DELETE)
+  - Ordered by version
+  - Immutable
+  - Complete audit trail
+end note
+
+== Command 1: Create Order ==
+
+client -> handler: CreateOrderCommand(\n  orderId: "ORD-123",\n  customerId: "CUST-456",\n  items: [...])
+activate handler
+
+handler -> aggregate: create(command)
+activate aggregate
+
+aggregate -> aggregate: validate(command)
+aggregate -> aggregate: applyBusinessRules()
+
+aggregate -> aggregate: apply(\n  OrderCreatedEvent)
+
+note right of aggregate
+  **Event-Driven State:**
+  ```java
+  public class OrderAggregate {
+    private OrderId id;
+    private OrderStatus status;
+    private List<DomainEvent> changes;
+    private int version = 0;
+    
+    public void create(
+      CreateOrderCommand cmd
+    ) {
+      // Validate
+      if (this.id != null) {
+        throw new OrderAlreadyExists();
+      }
+      
+      // Create event
+      OrderCreatedEvent event = 
+        new OrderCreatedEvent(
+          cmd.orderId,
+          cmd.customerId,
+          cmd.items,
+          calculateTotal(cmd.items)
+        );
+      
+      // Apply event
+      apply(event);
+      
+      // Record for persistence
+      changes.add(event);
+    }
+    
+    private void apply(
+      OrderCreatedEvent e
+    ) {
+      this.id = e.orderId;
+      this.customerId = e.customerId;
+      this.items = e.items;
+      this.total = e.total;
+      this.status = PENDING;
+      this.version++;
+    }
+  }
+  ```
+end note
+
+aggregate --> handler: OrderAggregate\n(version: 1,\n uncommitted: [OrderCreatedEvent])
+deactivate aggregate
+
+handler -> event_store: append(\n  aggregateId: "ORD-123",\n  events: [OrderCreatedEvent],\n  expectedVersion: 0)
+activate event_store
+
+event_store -> event_store: BEGIN TRANSACTION
+
+event_store -> event_store: SELECT MAX(event_version)\nFROM events\nWHERE aggregate_id = 'ORD-123'
+
+note right of event_store
+  **Optimistic Concurrency:**
+  - Check expected version
+  - If mismatch → ConcurrencyException
+  - Prevents lost updates
+end note
+
+event_store -> event_store: expectedVersion (0) == actual (null)\n✅ OK
+
+event_store -> event_store: INSERT INTO events\n(event_id, aggregate_id,\n aggregate_type, event_type,\n event_data, event_version,\n created_at)\nVALUES\n('evt-001', 'ORD-123', 'Order',\n 'OrderCreated', '{...}', 1,\n NOW())
+
+event_store -> event_store: COMMIT
+
+event_store --> handler: event persisted\n(version: 1)
+deactivate event_store
+
+handler -> event_bus: publish(OrderCreatedEvent)
+activate event_bus
+event_bus --> handler: ack
+deactivate event_bus
+
+handler --> client: CommandResult(\n  orderId: "ORD-123",\n  version: 1)
+deactivate handler
+
+== Projection: Build Read Model ==
+
+event_bus -> projector: OrderCreatedEvent(\n  orderId: "ORD-123",\n  customerId: "CUST-456",\n  items: [...],\n  total: 150.00)
+activate projector
+
+projector -> projector: buildProjection(event)
+
+projector -> read_model: INSERT INTO order_view\n(order_id, customer_id,\n items, total, status,\n created_at)\nVALUES\n('ORD-123', 'CUST-456',\n [...], 150.00, 'PENDING',\n NOW())
+activate read_model
+read_model --> projector: inserted
+deactivate read_model
+
+projector --> event_bus: ack
+deactivate projector
+
+note right of read_model
+  **Read Model (Current State):**
+  - Tradicional table
+  - Representa estado atual
+  - Reconstruída dos eventos
+  - Pode ser deletada e recriada
+  
+  order_view:
+  | order_id | customer_id | total  | status  |
+  |----------|-------------|--------|---------|
+  | ORD-123  | CUST-456    | 150.00 | PENDING |
+end note
+
+== Command 2: Add Item to Order ==
+
+client -> handler: AddItemCommand(\n  orderId: "ORD-123",\n  productId: "PROD-789",\n  quantity: 2)
+activate handler
+
+handler -> event_store: loadEvents("ORD-123")
+activate event_store
+
+event_store -> event_store: SELECT event_data, event_version\nFROM events\nWHERE aggregate_id = 'ORD-123'\nORDER BY event_version ASC
+
+event_store --> handler: [\n  OrderCreatedEvent (v1)\n]
+deactivate event_store
+
+handler -> aggregate: rehydrate(events)
+activate aggregate
+
+aggregate -> aggregate: apply(OrderCreatedEvent)
+note right of aggregate
+  **Event Sourcing:**
+  - Estado reconstruído dos eventos
+  - Replay sequencial
+  - Aggregate "rehydrated"
+end note
+
+aggregate --> handler: OrderAggregate\n(version: 1, status: PENDING)
+deactivate aggregate
+
+handler -> aggregate: addItem(command)
+activate aggregate
+
+aggregate -> aggregate: validateCanAddItem()
+aggregate -> aggregate: apply(\n  ItemAddedEvent)
+
+aggregate --> handler: OrderAggregate\n(version: 2,\n uncommitted: [ItemAddedEvent])
+deactivate aggregate
+
+handler -> event_store: append(\n  aggregateId: "ORD-123",\n  events: [ItemAddedEvent],\n  expectedVersion: 1)
+activate event_store
+
+event_store -> event_store: SELECT MAX(event_version)\nFROM events\nWHERE aggregate_id = 'ORD-123'
+
+event_store -> event_store: actual version = 1\nexpected version = 1\n✅ OK
+
+event_store -> event_store: INSERT INTO events\n(..., event_version = 2, ...)
+
+event_store --> handler: event persisted (v2)
+deactivate event_store
+
+handler -> event_bus: publish(ItemAddedEvent)
+event_bus --> handler: ack
+
+handler --> client: CommandResult(version: 2)
+deactivate handler
+
+== Projection: Update Read Model ==
+
+event_bus -> projector: ItemAddedEvent(\n  orderId: "ORD-123",\n  productId: "PROD-789",\n  quantity: 2,\n  price: 50.00)
+activate projector
+
+projector -> read_model: UPDATE order_view\nSET\n  total = total + 100.00,\n  item_count = item_count + 1\nWHERE order_id = 'ORD-123'
+activate read_model
+read_model --> projector: updated
+deactivate read_model
+
+projector --> event_bus: ack
+deactivate projector
+
+note right of read_model
+  **Read Model Updated:**
+  | order_id | customer_id | total  | status  | item_count |
+  |----------|-------------|--------|---------|------------|
+  | ORD-123  | CUST-456    | 250.00 | PENDING | 2          |
+  
+  Estado atual derivado dos eventos acumulados
+end note
+
+== Command 3: Confirm Order ==
+
+client -> handler: ConfirmOrderCommand(\n  orderId: "ORD-123")
+activate handler
+
+handler -> event_store: loadEvents("ORD-123")
+activate event_store
+event_store --> handler: [\n  OrderCreatedEvent (v1),\n  ItemAddedEvent (v2)\n]
+deactivate event_store
+
+handler -> aggregate: rehydrate(events)
+activate aggregate
+aggregate -> aggregate: apply(OrderCreatedEvent)
+aggregate -> aggregate: apply(ItemAddedEvent)
+aggregate --> handler: OrderAggregate (v2)
+deactivate aggregate
+
+handler -> aggregate: confirm()
+activate aggregate
+aggregate -> aggregate: validateCanConfirm()
+aggregate -> aggregate: apply(\n  OrderConfirmedEvent)
+aggregate --> handler: OrderAggregate\n(v3, uncommitted: [OrderConfirmedEvent])
+deactivate aggregate
+
+handler -> event_store: append(\n  aggregateId: "ORD-123",\n  events: [OrderConfirmedEvent],\n  expectedVersion: 2)
+activate event_store
+event_store -> event_store: INSERT event (v3)
+event_store --> handler: persisted (v3)
+deactivate event_store
+
+handler -> event_bus: publish(OrderConfirmedEvent)
+handler --> client: CommandResult(version: 3)
+deactivate handler
+
+event_bus -> projector: OrderConfirmedEvent
+activate projector
+projector -> read_model: UPDATE order_view\nSET status = 'CONFIRMED'\nWHERE order_id = 'ORD-123'
+read_model --> projector: updated
+projector --> event_bus: ack
+deactivate projector
+
+== Event Store: Complete History ==
+
+note over event_store
+  **Event Store for ORD-123:**
+  
+  | event_id | aggregate_id | event_type       | version | created_at          |
+  |----------|--------------|------------------|---------|---------------------|
+  | evt-001  | ORD-123      | OrderCreated     | 1       | 2025-11-15 10:00:00 |
+  | evt-002  | ORD-123      | ItemAdded        | 2       | 2025-11-15 10:05:00 |
+  | evt-003  | ORD-123      | OrderConfirmed   | 3       | 2025-11-15 10:10:00 |
+  
+  **Event Data (evt-001 - OrderCreated):**
+  ```json
+  {
+    "orderId": "ORD-123",
+    "customerId": "CUST-456",
+    "items": [
+      {"productId": "PROD-001", "quantity": 1, "price": 150.00}
+    ],
+    "total": 150.00,
+    "createdAt": "2025-11-15T10:00:00Z"
+  }
+  ```
+  
+  **Event Data (evt-002 - ItemAdded):**
+  ```json
+  {
+    "orderId": "ORD-123",
+    "productId": "PROD-789",
+    "quantity": 2,
+    "price": 50.00,
+    "addedAt": "2025-11-15T10:05:00Z"
+  }
+  ```
+  
+  **Complete Audit Trail:** Toda a história preservada!
+end note
+
+== Rebuilding Aggregate from Events ==
+
+participant "New Handler\nInstance" as new_handler
+
+new_handler -> event_store: loadEvents("ORD-123")
+activate new_handler
+activate event_store
+
+event_store --> new_handler: [\n  OrderCreatedEvent (v1),\n  ItemAddedEvent (v2),\n  OrderConfirmedEvent (v3)\n]
+deactivate event_store
+
+new_handler -> aggregate: new OrderAggregate()
+activate aggregate
+aggregate --> new_handler: empty aggregate
+deactivate aggregate
+
+loop for each event
+  new_handler -> aggregate: apply(event)
+  activate aggregate
+  aggregate -> aggregate: update internal state
+  aggregate --> new_handler: state updated
+  deactivate aggregate
+end
+
+new_handler -> new_handler: final state:\n  orderId: ORD-123\n  items: 2\n  total: 250.00\n  status: CONFIRMED\n  version: 3
+
+note right of new_handler
+  **State Reconstruction:**
+  - Estado atual derivado de eventos
+  - Mesmo resultado sempre
+  - Determinístico
+  - Testável (replay events)
+end note
+
+new_handler --> new_handler: aggregate ready
+deactivate new_handler
+
+== Snapshots for Performance ==
+
+client -> handler: GetOrderCommand("ORD-123")
+activate handler
+
+handler -> event_store: getLatestSnapshot("ORD-123")
+activate event_store
+
+event_store -> event_store: SELECT snapshot_data,\n       snapshot_version\nFROM snapshots\nWHERE aggregate_id = 'ORD-123'\nORDER BY snapshot_version DESC\nLIMIT 1
+
+event_store --> handler: Snapshot(\n  version: 2,\n  data: {...})
+deactivate event_store
+
+note right of event_store
+  **Snapshot:**
+  - Estado salvo em ponto específico
+  - Evita replay de todos eventos
+  - Criado periodicamente (ex: a cada 10 eventos)
+  - Opcional (otimização)
+end note
+
+handler -> event_store: loadEventsSince(\n  aggregateId: "ORD-123",\n  fromVersion: 2)
+activate event_store
+
+event_store --> handler: [\n  OrderConfirmedEvent (v3)\n]
+deactivate event_store
+
+handler -> aggregate: rehydrate(\n  snapshot: v2,\n  events: [OrderConfirmedEvent])
+activate aggregate
+
+aggregate -> aggregate: apply snapshot state (v2)
+aggregate -> aggregate: apply(OrderConfirmedEvent) → v3
+
+aggregate --> handler: OrderAggregate (v3)
+deactivate aggregate
+
+note right of handler
+  **Performance Gain:**
+  - Sem snapshot: replay 1000 eventos
+  - Com snapshot: replay 10 eventos
+  - Snapshot @ v990 + 10 novos eventos
+  
+  **Trade-off:**
+  - Snapshot storage cost
+  - Snapshot creation overhead
+  - Complexity
+end note
+
+handler --> client: OrderDTO
+deactivate handler
+
+== Time Travel: Query Past State ==
+
+client -> handler: GetOrderAtTime(\n  orderId: "ORD-123",\n  timestamp: "2025-11-15T10:07:00")
+activate handler
+
+handler -> event_store: loadEventsUntil(\n  aggregateId: "ORD-123",\n  until: "2025-11-15T10:07:00")
+activate event_store
+
+event_store -> event_store: SELECT event_data\nFROM events\nWHERE aggregate_id = 'ORD-123'\n  AND created_at <= '2025-11-15 10:07:00'\nORDER BY event_version ASC
+
+event_store --> handler: [\n  OrderCreatedEvent (10:00:00),\n  ItemAddedEvent (10:05:00)\n] (OrderConfirmedEvent @ 10:10:00 excluded)
+deactivate event_store
+
+handler -> aggregate: rehydrate(events)
+activate aggregate
+aggregate -> aggregate: apply(OrderCreatedEvent)
+aggregate -> aggregate: apply(ItemAddedEvent)
+aggregate --> handler: OrderAggregate\n(v2, status: PENDING)
+deactivate aggregate
+
+handler --> client: OrderDTO(\n  status: PENDING,\n  items: 2,\n  total: 250.00)\n\n**Estado em 10:07:00**\n(antes da confirmação)
+deactivate handler
+
+note right of client
+  **Time Travel:**
+  - Query estado passado
+  - Audit & compliance
+  - Debugging
+  - Reproduzir bugs
+  
+  "Como estava o pedido às 10:07?"
+  → Replay até aquele momento!
+end note
+
+== Benefits & Challenges ==
+
+note over event_store, read_model
+  **Benefits:**
+  
+  ✅ **Complete Audit Trail:**
+  - Every state change recorded
+  - Who, what, when, why
+  - Compliance & regulatory
+  
+  ✅ **Time Travel:**
+  - Query past state
+  - Debugging
+  - Temporal queries
+  
+  ✅ **Event-Driven Architecture:**
+  - Events published automatically
+  - Loosely coupled
+  - Reactive systems
+  
+  ✅ **Flexibility:**
+  - New projections from existing events
+  - Rebuild read models
+  - Fix bugs by replaying
+  
+  ✅ **No Data Loss:**
+  - Append-only
+  - Cannot lose history
+  - Immutable
+  
+  **Challenges:**
+  
+  ⚠️ **Complexity:**
+  - Learning curve steep
+  - More code
+  - Event versioning
+  
+  ⚠️ **Performance:**
+  - Replay can be slow
+  - Requires snapshots
+  - Event store growth
+  
+  ⚠️ **Event Schema Evolution:**
+  - Events immutable
+  - Schema changes complex
+  - Upcasting needed
+  
+  ⚠️ **Eventual Consistency:**
+  - Read model delayed
+  - Not for all domains
+  
+  **When to Use:**
+  - Audit trail required
+  - Complex domains
+  - Event-driven architecture
+  - Temporal queries needed
+  
+  **When NOT to Use:**
+  - Simple CRUD
+  - Strong consistency required
+  - Small team
+  - No audit requirements
+end note
+
+@enduml

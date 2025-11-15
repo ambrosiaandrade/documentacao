@@ -1,0 +1,392 @@
+@startuml Saga Pattern - Choreography vs Orchestration
+!theme plain
+skinparam sequenceMessageAlign center
+
+title Saga Pattern - Choreography (Event-Driven) vs Orchestration
+
+== Choreography Pattern (Decentralized) ==
+
+participant "Order Service" as order_choreo
+queue "Order Events" as order_events
+participant "Payment Service" as payment_choreo
+queue "Payment Events" as payment_events
+participant "Inventory Service" as inventory_choreo
+queue "Inventory Events" as inventory_events
+participant "Shipping Service" as shipping_choreo
+
+note over order_choreo, shipping_choreo
+  **Choreography: Each service knows what to do**
+  - No central coordinator
+  - Services react to events
+  - Decentralized decision-making
+end note
+
+order_choreo -> order_events: Publish\nOrderCreatedEvent
+activate order_choreo
+activate order_events
+
+note right of order_events
+  **Event:**
+  ```json
+  {
+    "eventType": "OrderCreated",
+    "orderId": "ORD-123",
+    "customerId": "CUST-456",
+    "items": [...],
+    "total": 150.00
+  }
+  ```
+end note
+
+order_events --> payment_choreo: Subscribe\n(listens to OrderCreatedEvent)
+deactivate order_events
+deactivate order_choreo
+activate payment_choreo
+
+payment_choreo -> payment_choreo: Process payment\nfor ORD-123
+
+payment_choreo -> payment_events: Publish\nPaymentCompletedEvent
+activate payment_events
+
+note right of payment_events
+  **Event:**
+  ```json
+  {
+    "eventType": "PaymentCompleted",
+    "orderId": "ORD-123",
+    "paymentId": "PAY-789",
+    "amount": 150.00
+  }
+  ```
+end note
+
+payment_events --> inventory_choreo: Subscribe\n(listens to PaymentCompletedEvent)
+deactivate payment_events
+deactivate payment_choreo
+activate inventory_choreo
+
+inventory_choreo -> inventory_choreo: Reserve inventory\nfor ORD-123
+
+inventory_choreo -> inventory_events: Publish\nInventoryReservedEvent
+activate inventory_events
+
+inventory_events --> shipping_choreo: Subscribe
+deactivate inventory_events
+deactivate inventory_choreo
+activate shipping_choreo
+
+shipping_choreo -> shipping_choreo: Ship order ORD-123
+
+shipping_choreo -> shipping_choreo: Saga Complete ✅
+deactivate shipping_choreo
+
+note right of shipping_choreo
+  **Choreography Benefits:**
+  ✅ Loose coupling
+  ✅ No single point of failure
+  ✅ Services independently deployable
+  
+  **Choreography Drawbacks:**
+  ❌ Hard to understand flow
+  ❌ Difficult to track saga state
+  ❌ Cyclic dependencies possible
+  ❌ No central monitoring
+end note
+
+== Choreography Compensation (Failure) ==
+
+order_choreo -> order_events: OrderCreatedEvent
+activate order_choreo
+activate order_events
+order_events --> payment_choreo: Subscribe
+deactivate order_events
+deactivate order_choreo
+activate payment_choreo
+
+payment_choreo -> payment_choreo: Payment successful
+
+payment_choreo -> payment_events: PaymentCompletedEvent
+activate payment_events
+payment_events --> inventory_choreo: Subscribe
+deactivate payment_events
+deactivate payment_choreo
+activate inventory_choreo
+
+inventory_choreo -> inventory_choreo: Try reserve inventory\nFAILED (out of stock) ❌
+
+inventory_choreo -> inventory_events: Publish\nInventoryReservationFailedEvent
+activate inventory_events
+
+note right of inventory_events
+  **Compensation Event:**
+  ```json
+  {
+    "eventType": "InventoryReservationFailed",
+    "orderId": "ORD-123",
+    "reason": "OUT_OF_STOCK"
+  }
+  ```
+end note
+
+inventory_events --> payment_choreo: Subscribe\n(trigger compensation)
+deactivate inventory_events
+deactivate inventory_choreo
+activate payment_choreo
+
+payment_choreo -> payment_choreo: Compensate:\nRefund payment PAY-789
+
+payment_choreo -> payment_events: Publish\nPaymentRefundedEvent
+activate payment_events
+payment_events --> order_choreo: Subscribe
+deactivate payment_events
+deactivate payment_choreo
+activate order_choreo
+
+order_choreo -> order_choreo: Compensate:\nCancel order ORD-123
+
+order_choreo -> order_choreo: Saga Failed ❌\nAll compensations complete
+deactivate order_choreo
+
+note right of order_choreo
+  **Compensation Chain:**
+  
+  Inventory Fails
+  → Payment compensates (refund)
+  → Order compensates (cancel)
+  
+  **Challenge:**
+  Each service must know who to notify
+end note
+
+== Orchestration Pattern (Centralized) ==
+
+participant "Order Service" as order_orch
+participant "Saga Orchestrator" as orchestrator
+participant "Payment Service" as payment_orch
+participant "Inventory Service" as inventory_orch
+participant "Shipping Service" as shipping_orch
+database "Saga Log" as saga_log
+
+note over order_orch, saga_log
+  **Orchestration: Central coordinator controls flow**
+  - Saga Orchestrator knows the entire workflow
+  - Services are simple (no event logic)
+  - Centralized decision-making
+end note
+
+order_orch -> orchestrator: Create order ORD-123
+activate order_orch
+activate orchestrator
+
+orchestrator -> saga_log: CREATE saga\nSET state='STARTED'\nSET steps='[]'
+activate saga_log
+saga_log --> orchestrator: Saga created
+deactivate saga_log
+
+orchestrator -> payment_orch: POST /payment\n{ orderId: ORD-123,\n  amount: 150.00 }
+activate payment_orch
+
+payment_orch --> orchestrator: Payment successful\nPAY-789
+deactivate payment_orch
+
+orchestrator -> saga_log: UPDATE saga\nADD step: 'payment_completed'
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator -> inventory_orch: POST /inventory/reserve\n{ orderId: ORD-123,\n  items: [...] }
+activate inventory_orch
+
+inventory_orch --> orchestrator: Inventory reserved
+deactivate inventory_orch
+
+orchestrator -> saga_log: UPDATE saga\nADD step: 'inventory_reserved'
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator -> shipping_orch: POST /shipping/create\n{ orderId: ORD-123 }
+activate shipping_orch
+
+shipping_orch --> orchestrator: Shipping created
+deactivate shipping_orch
+
+orchestrator -> saga_log: UPDATE saga\nSET state='COMPLETED'
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator --> order_orch: Saga completed ✅
+deactivate orchestrator
+deactivate order_orch
+
+note right of orchestrator
+  **Orchestration Benefits:**
+  ✅ Clear workflow (easy to understand)
+  ✅ Centralized monitoring
+  ✅ Easy to add steps
+  ✅ Saga state visible
+  
+  **Orchestration Drawbacks:**
+  ❌ Single point of failure
+  ❌ Tight coupling to orchestrator
+  ❌ Orchestrator can become complex
+end note
+
+== Orchestration Compensation (Failure) ==
+
+order_orch -> orchestrator: Create order ORD-124
+activate order_orch
+activate orchestrator
+
+orchestrator -> saga_log: CREATE saga ORD-124
+activate saga_log
+saga_log --> orchestrator: Created
+deactivate saga_log
+
+orchestrator -> payment_orch: Process payment
+activate payment_orch
+payment_orch --> orchestrator: Payment OK ✅
+deactivate payment_orch
+
+orchestrator -> saga_log: ADD step: payment_completed
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator -> inventory_orch: Reserve inventory
+activate inventory_orch
+inventory_orch --> orchestrator: OUT_OF_STOCK ❌
+deactivate inventory_orch
+
+note right of orchestrator
+  **Compensation Triggered:**
+  Inventory failed
+  → Orchestrator initiates rollback
+  → Reverse order of steps
+end note
+
+orchestrator -> saga_log: UPDATE saga\nSET state='COMPENSATING'
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator -> payment_orch: POST /payment/refund\n{ paymentId: PAY-789 }
+activate payment_orch
+
+note right of orchestrator
+  **Compensation Steps:**
+  
+  1. Inventory failed (step 2)
+  2. Compensate payment (step 1)
+  3. No order compensation needed
+  
+  **Reverse order:**
+  Last successful step first
+end note
+
+payment_orch --> orchestrator: Refunded ✅
+deactivate payment_orch
+
+orchestrator -> saga_log: UPDATE saga\nSET state='COMPENSATED'\nADD compensation: 'payment_refunded'
+activate saga_log
+saga_log --> orchestrator: Updated
+deactivate saga_log
+
+orchestrator --> order_orch: Saga failed\nAll compensated ✅
+deactivate orchestrator
+deactivate order_orch
+
+== Comparison Matrix ==
+
+note over order_choreo, saga_log
+  **Choreography vs Orchestration:**
+  
+  | Aspect | Choreography | Orchestration |
+  |--------|--------------|---------------|
+  | **Coordination** | Decentralized | Centralized |
+  | **Coupling** | Loose | Tight |
+  | **Complexity** | Distributed | Concentrated |
+  | **Visibility** | Hard to track | Easy to monitor |
+  | **Failure Handling** | Each service handles | Orchestrator handles |
+  | **Adding Steps** | Modify multiple services | Modify orchestrator only |
+  | **Single Point of Failure** | No | Yes (orchestrator) |
+  | **Event Overhead** | High | Low |
+  | **Use Case** | Simple workflows | Complex workflows |
+  
+  **When to use Choreography:**
+  - Simple workflows (2-3 services)
+  - Services already event-driven
+  - High autonomy required
+  - No complex business logic
+  - Example: Notification fan-out
+  
+  **When to use Orchestration:**
+  - Complex workflows (4+ services)
+  - Multiple decision points
+  - Need central monitoring
+  - Business process management
+  - Example: Order fulfillment, onboarding
+  
+  **Hybrid Approach:**
+  - Use orchestration for critical paths
+  - Use choreography for side effects (notifications, analytics)
+  - Best of both worlds
+  
+  **Implementation:**
+  
+  **Choreography:**
+  ```python
+  # Each service listens to events
+  
+  @event_handler('OrderCreated')
+  def on_order_created(event):
+    payment = process_payment(event.orderId)
+    publish_event('PaymentCompleted', payment)
+  
+  @event_handler('PaymentCompleted')
+  def on_payment_completed(event):
+    inventory = reserve_inventory(event.orderId)
+    publish_event('InventoryReserved', inventory)
+  ```
+  
+  **Orchestration:**
+  ```python
+  # Orchestrator controls flow
+  
+  class OrderSagaOrchestrator:
+    def execute(self, order):
+      saga = SagaLog.create(order.id)
+      
+      try:
+        # Step 1: Payment
+        payment = payment_service.process(order)
+        saga.add_step('payment', payment)
+        
+        # Step 2: Inventory
+        inventory = inventory_service.reserve(order)
+        saga.add_step('inventory', inventory)
+        
+        # Step 3: Shipping
+        shipping = shipping_service.create(order)
+        saga.add_step('shipping', shipping)
+        
+        saga.complete()
+      except Exception as e:
+        # Compensate in reverse order
+        self.compensate(saga)
+    
+    def compensate(self, saga):
+      for step in reversed(saga.steps):
+        if step.name == 'shipping':
+          shipping_service.cancel(step.id)
+        elif step.name == 'inventory':
+          inventory_service.release(step.id)
+        elif step.name == 'payment':
+          payment_service.refund(step.id)
+      
+      saga.compensated()
+  ```
+end note
+
+@enduml

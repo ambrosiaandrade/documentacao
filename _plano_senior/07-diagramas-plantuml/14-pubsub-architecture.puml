@@ -1,0 +1,710 @@
+@startuml Pub-Sub Architecture - Event-Driven Messaging
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Pub/Sub Pattern - Kafka-based Event-Driven Architecture
+
+participant "OrderService\n(Publisher)" as order_service
+participant "PaymentService\n(Publisher)" as payment_service
+participant "InventoryService\n(Publisher)" as inventory_service
+queue "Kafka Broker\n(Message Broker)" as kafka
+participant "Order Topic\nPartition 0" as order_topic_p0
+participant "Order Topic\nPartition 1" as order_topic_p1
+participant "Payment Topic" as payment_topic
+participant "Email Service\n(Subscriber)" as email_subscriber
+participant "SMS Service\n(Subscriber)" as sms_subscriber
+participant "Analytics Service\n(Subscriber)" as analytics_subscriber
+participant "Warehouse Service\n(Subscriber)" as warehouse_subscriber
+database "Consumer Offset\nStorage" as offset_storage
+
+== Topic Creation & Subscription ==
+
+order_service -> kafka: Create topic:\n"order.events"\npartitions: 2\nreplication: 3
+activate order_service
+activate kafka
+
+kafka -> order_topic_p0: Create partition 0
+activate order_topic_p0
+order_topic_p0 --> kafka: created
+deactivate order_topic_p0
+
+kafka -> order_topic_p1: Create partition 1
+activate order_topic_p1
+order_topic_p1 --> kafka: created
+deactivate order_topic_p1
+
+kafka --> order_service: topic created
+deactivate kafka
+deactivate order_service
+
+note right of kafka
+  **Kafka Topic Configuration:**
+  
+  Topic: order.events
+  Partitions: 2 (for parallelism)
+  Replication Factor: 3 (high availability)
+  Retention: 7 days
+  Cleanup Policy: delete
+  
+  **Partition Key:** customer_id
+  - Same customer → same partition
+  - Preserves order per customer
+end note
+
+email_subscriber -> kafka: Subscribe to\n"order.events"\ngroup: notification-service
+activate email_subscriber
+activate kafka
+
+kafka -> offset_storage: Register consumer\ngroup: notification-service\ntopic: order.events\npartition: 0
+activate offset_storage
+
+note right of offset_storage
+  **Consumer Group:**
+  
+  Group: notification-service
+  Members:
+  - email-subscriber (partition 0)
+  - sms-subscriber (partition 1)
+  
+  **Load balancing:**
+  Each partition consumed by 
+  one member only
+end note
+
+offset_storage --> kafka: registered
+deactivate offset_storage
+
+kafka --> email_subscriber: subscribed\nassigned partition 0
+deactivate kafka
+deactivate email_subscriber
+
+sms_subscriber -> kafka: Subscribe to\n"order.events"\ngroup: notification-service
+activate sms_subscriber
+activate kafka
+
+kafka -> offset_storage: Register consumer\nassign partition 1
+activate offset_storage
+offset_storage --> kafka: registered
+deactivate offset_storage
+
+kafka --> sms_subscriber: subscribed\nassigned partition 1
+deactivate kafka
+deactivate sms_subscriber
+
+analytics_subscriber -> kafka: Subscribe to\n"order.events"\ngroup: analytics-service
+activate analytics_subscriber
+activate kafka
+
+note right of analytics_subscriber
+  **Different Consumer Group:**
+  
+  Group: analytics-service
+  - Independent offset tracking
+  - Receives ALL messages
+  - Not affected by notification-service
+  
+  **Fan-out:**
+  Same message → multiple groups
+end note
+
+kafka -> offset_storage: Register consumer\ngroup: analytics-service\npartitions: 0,1
+activate offset_storage
+offset_storage --> kafka: registered
+deactivate offset_storage
+
+kafka --> analytics_subscriber: subscribed\nassigned partitions 0,1
+deactivate kafka
+deactivate analytics_subscriber
+
+== Event Publishing: Order Created ==
+
+actor Cliente as client
+
+client -> order_service: POST /orders\n{ items, customer }
+activate client
+activate order_service
+
+order_service -> order_service: validate request
+order_service -> order_service: save order to DB\norder.id = "ORD-123"\norder.customerId = "CUST-456"
+
+note right of order_service
+  **Event Publishing:**
+  1. Save to database (source of truth)
+  2. Publish event to Kafka
+  3. Return response immediately
+  
+  **Transactional Outbox:**
+  - Event saved in DB transaction
+  - Background process publishes
+  - Guarantees at-least-once delivery
+end note
+
+order_service -> kafka: Publish event:\ntopic: "order.events"\nkey: "CUST-456"\nvalue: OrderCreatedEvent {\n  orderId: "ORD-123",\n  customerId: "CUST-456",\n  amount: 150.00,\n  timestamp: now\n}
+activate kafka
+
+note right of kafka
+  **Partition Selection:**
+  
+  Hash(key) % partitions
+  = Hash("CUST-456") % 2
+  = Partition 1
+  
+  **All events for CUST-456
+  go to same partition**
+  → Order preserved!
+end note
+
+kafka -> order_topic_p1: Append message\noffset: 42
+activate order_topic_p1
+
+note right of order_topic_p1
+  **Message Storage:**
+  
+  Partition 1, Offset 42
+  Key: CUST-456
+  Value: OrderCreatedEvent (JSON/Avro)
+  Timestamp: 2025-11-15T10:30:00Z
+  Headers: 
+    - correlation-id: abc-123
+    - event-type: order.created.v1
+  
+  **Immutable & Ordered**
+end note
+
+order_topic_p1 --> kafka: appended\noffset: 42
+deactivate order_topic_p1
+
+kafka --> order_service: Message published\npartition: 1\noffset: 42
+deactivate kafka
+
+order_service --> client: 201 Created\n{ "orderId": "ORD-123" }
+deactivate order_service
+deactivate client
+
+note right of client
+  **Asynchronous:**
+  - Client receives response immediately
+  - Event processing happens in background
+  - Decoupled from subscribers
+end note
+
+== Event Consumption: Notification Group ==
+
+sms_subscriber -> kafka: Poll messages\ngroup: notification-service\npartition: 1
+activate sms_subscriber
+activate kafka
+
+kafka -> order_topic_p1: Fetch messages\nfrom offset 42
+activate order_topic_p1
+
+order_topic_p1 --> kafka: [OrderCreatedEvent]\noffset: 42
+deactivate order_topic_p1
+
+kafka --> sms_subscriber: [OrderCreatedEvent]\noffset: 42
+deactivate kafka
+
+note right of sms_subscriber
+  **SMS Subscriber Assigned:**
+  Partition 1
+  
+  **Email Subscriber Assigned:**
+  Partition 0
+  
+  **Load balanced within group!**
+end note
+
+sms_subscriber -> sms_subscriber: Process event:\nOrderCreatedEvent
+
+participant "SMS Gateway" as sms_gateway
+
+sms_subscriber -> sms_gateway: sendSMS(\n  to: customer.phone,\n  text: "Order ORD-123 confirmed!")
+activate sms_gateway
+
+note right of sms_gateway
+  **SMS Content:**
+  To: +55 11 98765-4321
+  
+  Your order ORD-123 has been confirmed!
+  Total: $150.00
+  Track: http://shop.com/track/ORD-123
+end note
+
+sms_gateway --> sms_subscriber: SMS sent ✅
+deactivate sms_gateway
+
+sms_subscriber -> kafka: Commit offset 43\ngroup: notification-service\npartition: 1
+activate kafka
+
+kafka -> offset_storage: UPDATE offsets\nSET offset = 43\nWHERE group = 'notification-service'\n  AND partition = 1
+activate offset_storage
+
+note right of offset_storage
+  **Offset Commit:**
+  
+  Group: notification-service
+  Topic: order.events
+  Partition 1: offset 43
+  
+  **Next poll starts from 43**
+  → Message 42 not re-read
+end note
+
+offset_storage --> kafka: offset committed
+deactivate offset_storage
+
+kafka --> sms_subscriber: offset committed
+deactivate kafka
+
+sms_subscriber --> sms_subscriber: Processing complete
+deactivate sms_subscriber
+
+== Event Consumption: Analytics Group ==
+
+analytics_subscriber -> kafka: Poll messages\ngroup: analytics-service\npartitions: 0,1
+activate analytics_subscriber
+activate kafka
+
+note right of analytics_subscriber
+  **Analytics Subscriber:**
+  - Separate consumer group
+  - Receives same events
+  - Independent offset
+  - Fan-out pattern!
+end note
+
+kafka -> order_topic_p1: Fetch messages\nfrom offset 42\n(analytics group)
+activate order_topic_p1
+
+order_topic_p1 --> kafka: [OrderCreatedEvent]\noffset: 42
+deactivate order_topic_p1
+
+kafka --> analytics_subscriber: [OrderCreatedEvent]\noffset: 42
+deactivate kafka
+
+analytics_subscriber -> analytics_subscriber: Process event:\nextract metrics
+
+database "Analytics DB\n(ClickHouse)" as analytics_db
+
+analytics_subscriber -> analytics_db: INSERT INTO order_events\n(order_id, customer_id,\n amount, event_time)\nVALUES\n('ORD-123', 'CUST-456',\n 150.00, NOW())
+activate analytics_db
+
+note right of analytics_db
+  **Analytics Storage:**
+  - OLAP database (ClickHouse)
+  - Columnar storage
+  - Fast aggregations
+  - Metrics dashboards
+  
+  **Queries:**
+  - Orders per hour
+  - Revenue trends
+  - Customer segments
+end note
+
+analytics_db --> analytics_subscriber: inserted
+deactivate analytics_db
+
+analytics_subscriber -> kafka: Commit offset 43\ngroup: analytics-service\npartition: 1
+activate kafka
+
+kafka -> offset_storage: UPDATE offsets\ngroup: analytics-service
+activate offset_storage
+offset_storage --> kafka: committed
+deactivate offset_storage
+
+kafka --> analytics_subscriber: offset committed
+deactivate kafka
+
+analytics_subscriber --> analytics_subscriber: Processing complete
+deactivate analytics_subscriber
+
+note right of analytics_subscriber
+  **Same Event, Two Consumers:**
+  - notification-service processed
+  - analytics-service processed
+  - Both committed independently
+  
+  **Pub/Sub benefit!**
+end note
+
+== Event Publishing: Payment Completed ==
+
+payment_service -> kafka: Publish event:\ntopic: "payment.events"\nkey: "ORD-123"\nvalue: PaymentCompletedEvent {\n  orderId: "ORD-123",\n  paymentId: "PAY-789",\n  amount: 150.00,\n  method: "CREDIT_CARD"\n}
+activate payment_service
+activate kafka
+
+kafka -> payment_topic: Append message\noffset: 15
+activate payment_topic
+
+note right of payment_topic
+  **Different Topic:**
+  
+  Topic: payment.events
+  - Separate concern
+  - Different subscribers
+  - Independent scaling
+  
+  **Subscriber chooses topics**
+end note
+
+payment_topic --> kafka: appended
+deactivate payment_topic
+
+kafka --> payment_service: published
+deactivate kafka
+deactivate payment_service
+
+warehouse_subscriber -> kafka: Poll messages\ngroup: warehouse-service\ntopics: ["order.events",\n "payment.events"]
+activate warehouse_subscriber
+activate kafka
+
+note right of warehouse_subscriber
+  **Multi-Topic Subscription:**
+  
+  Warehouse subscribes to:
+  - order.events (for new orders)
+  - payment.events (for confirmed payments)
+  
+  **Only ship after payment confirmed!**
+end note
+
+kafka -> payment_topic: Fetch messages\nfrom offset 15
+activate payment_topic
+
+payment_topic --> kafka: [PaymentCompletedEvent]\noffset: 15
+deactivate payment_topic
+
+kafka --> warehouse_subscriber: [PaymentCompletedEvent]\noffset: 15
+deactivate kafka
+
+warehouse_subscriber -> warehouse_subscriber: Process event:\nPaymentCompletedEvent\norderId: ORD-123
+
+warehouse_subscriber -> warehouse_subscriber: Check order status:\norder exists ✅\npayment confirmed ✅
+
+warehouse_subscriber -> warehouse_subscriber: Ship order ORD-123
+
+warehouse_subscriber -> kafka: Publish event:\ntopic: "shipping.events"\nvalue: OrderShippedEvent {\n  orderId: "ORD-123",\n  trackingNumber: "TRK-999"\n}
+activate kafka
+
+note right of kafka
+  **Event Chain:**
+  
+  order.created 
+    → payment.completed 
+      → order.shipped
+        → order.delivered
+  
+  **Event-Driven Saga!**
+end note
+
+kafka --> warehouse_subscriber: published
+deactivate kafka
+
+warehouse_subscriber -> kafka: Commit offsets\npayment.events: 16
+activate kafka
+kafka --> warehouse_subscriber: committed
+deactivate kafka
+
+warehouse_subscriber --> warehouse_subscriber: Processing complete
+deactivate warehouse_subscriber
+
+== Error Handling: Consumer Failure ==
+
+email_subscriber -> kafka: Poll messages\npartition: 0
+activate email_subscriber
+activate kafka
+
+kafka -> order_topic_p0: Fetch messages\noffset 20
+activate order_topic_p0
+
+order_topic_p0 --> kafka: [OrderCreatedEvent]\noffset: 20
+deactivate order_topic_p0
+
+kafka --> email_subscriber: [OrderCreatedEvent]\noffset: 20
+deactivate kafka
+
+email_subscriber -> email_subscriber: Process event
+
+participant "Email Service" as email_service
+
+email_subscriber -> email_service: sendEmail(...)
+activate email_service
+
+email_service --> email_subscriber: ERROR 500\n(SMTP server down)
+deactivate email_service
+
+note right of email_subscriber
+  **Processing Failed:**
+  - SMTP server unavailable
+  - Email not sent
+  - What to do?
+  
+  **Options:**
+  1. Retry (with backoff)
+  2. Skip (commit offset)
+  3. Dead Letter Queue
+  4. Crash (restart from last commit)
+end note
+
+email_subscriber -> email_subscriber: Retry with backoff\nattempt 1/3
+
+email_subscriber -> email_service: sendEmail(...)\n(retry)
+activate email_service
+
+email_service --> email_subscriber: ERROR 500\n(still down)
+deactivate email_service
+
+email_subscriber -> email_subscriber: Wait 2 seconds
+
+email_subscriber -> email_subscriber: Retry attempt 2/3
+
+email_subscriber -> email_service: sendEmail(...)\n(retry)
+activate email_service
+
+email_service --> email_subscriber: ERROR 500\n(still down)
+deactivate email_service
+
+email_subscriber -> email_subscriber: Wait 4 seconds
+
+email_subscriber -> email_subscriber: Retry attempt 3/3
+
+email_subscriber -> email_service: sendEmail(...)\n(retry)
+activate email_service
+
+email_service --> email_subscriber: ERROR 500\n(still down)
+deactivate email_service
+
+note right of email_subscriber
+  **All Retries Exhausted:**
+  - 3 attempts failed
+  - Don't commit offset
+  - Send to Dead Letter Queue
+end note
+
+queue "Dead Letter Queue\n(DLQ)" as dlq
+
+email_subscriber -> dlq: Send to DLQ:\nOrderCreatedEvent\noffset: 20\nerror: "SMTP unavailable"\nretries: 3
+activate dlq
+
+note right of dlq
+  **Dead Letter Queue:**
+  
+  Topic: order.events.dlq
+  Message: OrderCreatedEvent (offset 20)
+  Error: "SMTP server unavailable"
+  Retries: 3
+  Timestamp: 2025-11-15T10:35:00Z
+  
+  **Manual intervention or replay later**
+end note
+
+dlq --> email_subscriber: DLQ sent
+deactivate dlq
+
+email_subscriber -> kafka: DON'T commit offset\n(will retry from 20 on restart)
+activate kafka
+
+note right of kafka
+  **Offset NOT Committed:**
+  - Last committed: offset 19
+  - On restart: will re-read offset 20
+  - At-least-once delivery
+  
+  **Idempotency important!**
+end note
+
+kafka --> email_subscriber: OK
+deactivate kafka
+
+email_subscriber --> email_subscriber: Continue polling\n(skip this message for now)
+deactivate email_subscriber
+
+== Message Guarantees ==
+
+note over order_service, analytics_subscriber
+  **Delivery Guarantees:**
+  
+  **1. At-Most-Once (acks=0):**
+  - Fire and forget
+  - No confirmation
+  - Fast but may lose messages
+  - Use case: Metrics, logs (lossy OK)
+  
+  **2. At-Least-Once (acks=1, manual commit):**
+  - Producer waits for leader ACK
+  - Consumer commits after processing
+  - May process duplicates (if crash before commit)
+  - Use case: Most applications (with idempotency)
+  
+  **3. Exactly-Once (acks=all, transactional):**
+  - Transactional producer + consumer
+  - Idempotent producer + read_committed isolation
+  - Expensive but guarantees no duplicates
+  - Use case: Financial transactions, payments
+  
+  **Configuration:**
+  
+  ```java
+  // Producer config
+  props.put("acks", "all"); // Wait for all replicas
+  props.put("enable.idempotence", true); // Dedup
+  props.put("max.in.flight.requests", 1); // Ordering
+  props.put("retries", Integer.MAX_VALUE);
+  
+  // Consumer config
+  props.put("enable.auto.commit", false); // Manual
+  props.put("isolation.level", "read_committed");
+  props.put("max.poll.records", 10); // Batch size
+  
+  // Consumer code
+  ConsumerRecords<K, V> records = 
+    consumer.poll(Duration.ofMillis(100));
+  
+  for (ConsumerRecord<K, V> record : records) {
+    processRecord(record); // Idempotent!
+  }
+  
+  consumer.commitSync(); // Commit after processing
+  ```
+end note
+
+== Event Schema Evolution ==
+
+note over order_service, kafka
+  **Schema Registry (Confluent):**
+  
+  **Version 1:**
+  ```json
+  {
+    "type": "record",
+    "name": "OrderCreatedEvent",
+    "namespace": "com.example.events",
+    "fields": [
+      {"name": "orderId", "type": "string"},
+      {"name": "customerId", "type": "string"},
+      {"name": "amount", "type": "double"}
+    ]
+  }
+  ```
+  
+  **Version 2 (Add field - BACKWARD compatible):**
+  ```json
+  {
+    "fields": [
+      {"name": "orderId", "type": "string"},
+      {"name": "customerId", "type": "string"},
+      {"name": "amount", "type": "double"},
+      {"name": "currency", "type": "string", 
+       "default": "USD"} // NEW with default
+    ]
+  }
+  ```
+  
+  **Old consumers can read new events!**
+  - Default value used if field missing
+  - Backward compatible
+  
+  **Version 3 (Remove field - FORWARD compatible):**
+  - Old producer, new consumer
+  - Consumer ignores unknown fields
+  
+  **FULL Compatibility:**
+  - Both backward and forward
+  - Add fields with defaults
+  - Never remove required fields
+  
+  **Schema Registry enforces compatibility!**
+end note
+
+== Benefits & Trade-offs ==
+
+note over email_subscriber, analytics_subscriber
+  **Benefits:**
+  
+  ✅ **Decoupling:**
+  - Publisher doesn't know subscribers
+  - Subscribers don't know each other
+  - Add/remove subscribers freely
+  
+  ✅ **Scalability:**
+  - Partitions for parallelism
+  - Consumer groups for load balancing
+  - Horizontal scaling
+  
+  ✅ **Durability:**
+  - Messages persisted to disk
+  - Replication for HA
+  - Replay from any offset
+  
+  ✅ **Fan-out:**
+  - One message, many consumers
+  - Different consumer groups
+  - Independent processing
+  
+  ✅ **Ordering:**
+  - Per-partition ordering guaranteed
+  - Partition key for related events
+  
+  ✅ **Backpressure:**
+  - Consumers poll at own pace
+  - Queue buffers messages
+  - No publisher slowdown
+  
+  **Trade-offs:**
+  
+  ⚠️ **Eventual Consistency:**
+  - Async processing
+  - Delay between publish and consume
+  - Not suitable for immediate reads
+  
+  ⚠️ **Complexity:**
+  - Kafka cluster management
+  - Consumer group coordination
+  - Offset management
+  
+  ⚠️ **Ordering Challenges:**
+  - Only within partition
+  - Multiple partitions = no global order
+  - Partition key required
+  
+  ⚠️ **Duplicate Messages:**
+  - At-least-once delivery
+  - Need idempotent consumers
+  - Deduplication logic
+  
+  ⚠️ **Schema Evolution:**
+  - Backward/forward compatibility
+  - Schema registry required
+  - Versioning strategy
+  
+  **Use Cases:**
+  
+  - **Event-Driven Architecture:** Microservices communication
+  - **CQRS:** Command → Event → Query model update
+  - **Event Sourcing:** Events as source of truth
+  - **Real-time Analytics:** Stream processing
+  - **Notification System:** Email, SMS, push
+  - **Audit Trail:** Record all events
+  - **Data Integration:** CDC, ETL pipelines
+  
+  **When to Use:**
+  - Async communication needed
+  - Multiple consumers for same event
+  - Decoupled services
+  - Event replay required
+  - High throughput
+  
+  **When NOT to Use:**
+  - Immediate consistency required
+  - Request-response pattern needed
+  - Low latency critical (<10ms)
+  - Simple point-to-point communication
+  
+  **Pub/Sub vs Observer:**
+  
+  **Pub/Sub:** Broker-based, distributed, durable
+  **Observer:** In-memory, single process, ephemeral
+end note
+
+@enduml

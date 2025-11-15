@@ -1,0 +1,587 @@
+@startuml Builder Pattern - Fluent API
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Builder Pattern - Test Data Builder
+
+participant "Test Method" as test
+participant "OrderBuilder" as builder
+participant "Order\n(Immutable)" as order
+participant "CustomerBuilder" as customer_builder
+participant "Customer" as customer
+participant "OrderItemBuilder" as item_builder
+participant "OrderItem" as item
+
+== Simple Builder Usage ==
+
+test -> builder: OrderBuilder.anOrder()
+activate test
+activate builder
+
+builder -> builder: new OrderBuilder()
+builder --> test: OrderBuilder instance
+deactivate builder
+
+note right of builder
+  **Fluent Interface:**
+  ```java
+  public class OrderBuilder {
+    private OrderId id;
+    private Customer customer;
+    private List<OrderItem> items = new ArrayList<>();
+    private Money total;
+    private OrderStatus status = PENDING;
+    private LocalDateTime createdAt;
+    
+    public static OrderBuilder anOrder() {
+      return new OrderBuilder();
+    }
+    
+    public OrderBuilder withId(OrderId id) {
+      this.id = id;
+      return this; // Fluent!
+    }
+    
+    public OrderBuilder withCustomer(Customer c) {
+      this.customer = c;
+      return this;
+    }
+    
+    // ... more methods
+    
+    public Order build() {
+      validate();
+      return new Order(
+        id, customer, items,
+        total, status, createdAt
+      );
+    }
+  }
+  ```
+end note
+
+test -> builder: withId("ORD-123")
+activate builder
+builder -> builder: this.id = "ORD-123"
+builder --> test: OrderBuilder (same instance)
+deactivate builder
+
+test -> builder: withCustomer(\n  CustomerBuilder\n    .aCustomer()\n    .withName("John")\n    .build())
+activate builder
+
+builder -> customer_builder: CustomerBuilder.aCustomer()
+activate customer_builder
+customer_builder --> builder: CustomerBuilder
+deactivate customer_builder
+
+builder -> customer_builder: withName("John")
+activate customer_builder
+customer_builder -> customer_builder: this.name = "John"
+customer_builder --> builder: CustomerBuilder
+deactivate customer_builder
+
+builder -> customer_builder: build()
+activate customer_builder
+customer_builder -> customer: new Customer(\n  name: "John",\n  email: "john@example.com" (default))
+activate customer
+customer --> customer_builder: Customer instance
+deactivate customer
+customer_builder --> builder: Customer
+deactivate customer_builder
+
+builder -> builder: this.customer = Customer
+builder --> test: OrderBuilder
+deactivate builder
+
+note right of customer_builder
+  **Nested Builders:**
+  - Builder dentro de builder
+  - Composição fluente
+  - Mantém legibilidade
+end note
+
+test -> builder: withItems(2)
+activate builder
+
+builder -> builder: for (i = 0; i < 2; i++)
+
+loop 2 times
+  builder -> item_builder: OrderItemBuilder.anItem()
+  activate item_builder
+  item_builder --> builder: OrderItemBuilder
+  deactivate item_builder
+  
+  builder -> item_builder: withProduct("Product-" + i)
+  activate item_builder
+  item_builder --> builder: OrderItemBuilder
+  deactivate item_builder
+  
+  builder -> item_builder: withQuantity(1)
+  activate item_builder
+  item_builder --> builder: OrderItemBuilder
+  deactivate item_builder
+  
+  builder -> item_builder: withPrice(50.00)
+  activate item_builder
+  item_builder --> builder: OrderItemBuilder
+  deactivate item_builder
+  
+  builder -> item_builder: build()
+  activate item_builder
+  item_builder -> item: new OrderItem(...)
+  activate item
+  item --> item_builder: OrderItem
+  deactivate item
+  item_builder --> builder: OrderItem
+  deactivate item_builder
+  
+  builder -> builder: items.add(OrderItem)
+end
+
+builder --> test: OrderBuilder
+deactivate builder
+
+test -> builder: build()
+activate builder
+
+builder -> builder: validate()
+
+note right of builder
+  **Validation Before Build:**
+  ```java
+  private void validate() {
+    if (customer == null) {
+      throw new IllegalStateException(
+        "Customer is required"
+      );
+    }
+    if (items.isEmpty()) {
+      throw new IllegalStateException(
+        "At least one item required"
+      );
+    }
+    if (total == null) {
+      calculateTotal();
+    }
+  }
+  ```
+end note
+
+builder -> builder: calculateTotal()
+builder -> builder: total = items.stream()\n  .map(OrderItem::getSubtotal)\n  .reduce(Money.ZERO, Money::add)
+
+builder -> order: new Order(\n  id: "ORD-123",\n  customer: Customer,\n  items: [2 items],\n  total: 100.00,\n  status: PENDING)
+activate order
+
+order -> order: validate invariants
+order -> order: freeze (immutable)
+
+order --> builder: Order instance
+deactivate order
+
+builder --> test: Order
+deactivate builder
+
+test -> test: assertThat(order.getId())\n  .isEqualTo("ORD-123")
+test -> test: assertThat(order.getItems())\n  .hasSize(2)
+test -> test: assertThat(order.getTotal())\n  .isEqualTo(100.00)
+
+deactivate test
+
+note right of test
+  **Test Readability:**
+  ```java
+  @Test
+  void shouldCreateOrder() {
+    // Given
+    Order order = OrderBuilder.anOrder()
+      .withId("ORD-123")
+      .withCustomer(
+        CustomerBuilder.aCustomer()
+          .withName("John")
+          .build()
+      )
+      .withItems(2)
+      .build();
+    
+    // Then
+    assertThat(order.getId())
+      .isEqualTo("ORD-123");
+    assertThat(order.getItems())
+      .hasSize(2);
+  }
+  ```
+  
+  **Legível como inglês! 🎉**
+end note
+
+== Convenience Methods (Object Mother Pattern) ==
+
+test -> builder: OrderBuilder.aCompletedOrder()
+activate test
+activate builder
+
+builder -> builder: anOrder()
+builder -> builder: withStatus(COMPLETED)
+builder -> builder: withCreatedAt(\n  LocalDateTime.now().minusDays(1))
+builder -> builder: withCompletedAt(\n  LocalDateTime.now())
+builder -> builder: withPaymentId("pay-123")
+
+note right of builder
+  **Convenience Methods:**
+  ```java
+  public static OrderBuilder 
+    aCompletedOrder() {
+    return anOrder()
+      .withStatus(COMPLETED)
+      .withCreatedAt(
+        LocalDateTime.now().minusDays(1)
+      )
+      .withCompletedAt(
+        LocalDateTime.now()
+      )
+      .withPaymentId("pay-123");
+  }
+  
+  public static OrderBuilder 
+    aPendingOrder() {
+    return anOrder()
+      .withStatus(PENDING)
+      .withCreatedAt(LocalDateTime.now());
+  }
+  
+  public static OrderBuilder 
+    anExpensiveOrder() {
+    return anOrder()
+      .withItems(10)
+      .withTotal(Money.of(5000.00));
+  }
+  ```
+  
+  **Object Mother Pattern:**
+  - Pré-configurações comuns
+  - Reduz código duplicado
+  - Expressivo
+end note
+
+builder --> test: OrderBuilder (pre-configured)
+deactivate builder
+
+test -> builder: build()
+activate builder
+builder -> order: new Order(...)
+order --> builder: Order
+builder --> test: Order (COMPLETED)
+deactivate builder
+
+deactivate test
+
+== Chaining with Defaults ==
+
+test -> builder: OrderBuilder.anOrder()\n  .withCustomer(\n    CustomerBuilder.vipCustomer()\n  )\n  .build()
+activate test
+activate builder
+
+builder -> customer_builder: CustomerBuilder.vipCustomer()
+activate customer_builder
+
+customer_builder -> customer_builder: aCustomer()
+customer_builder -> customer_builder: withVipStatus(true)
+customer_builder -> customer_builder: withDiscountPercent(10)
+customer_builder -> customer_builder: withEmail("vip@example.com")
+
+customer_builder --> builder: CustomerBuilder (pre-configured)
+deactivate customer_builder
+
+builder -> customer_builder: build()
+activate customer_builder
+customer_builder -> customer: new Customer(\n  vipStatus: true,\n  discount: 10%)
+customer --> customer_builder: Customer
+customer_builder --> builder: Customer (VIP)
+deactivate customer_builder
+
+builder -> builder: withCustomer(Customer VIP)
+
+note right of builder
+  **Sensible Defaults:**
+  - Builder fornece defaults
+  - Cliente override apenas necessário
+  - Menos verbose
+  
+  ```java
+  public class OrderBuilder {
+    private OrderId id = OrderId.generate();
+    private OrderStatus status = PENDING;
+    private LocalDateTime createdAt = 
+      LocalDateTime.now();
+    private List<OrderItem> items = 
+      new ArrayList<>();
+    
+    // Customer é required (sem default)
+    private Customer customer;
+    
+    // Total calculado automaticamente
+    private Money total;
+  }
+  ```
+end note
+
+builder --> test: OrderBuilder
+deactivate builder
+
+test -> builder: build()
+activate builder
+builder -> order: new Order(...)
+order --> builder: Order
+builder --> test: Order (VIP customer)
+deactivate builder
+
+deactivate test
+
+== Build and Persist ==
+
+test -> builder: OrderBuilder.anOrder()\n  .withCustomer(...)\n  .withItems(3)\n  .buildAndSave(repository)
+activate test
+activate builder
+
+builder -> builder: build()
+activate builder
+builder -> order: new Order(...)
+order --> builder: Order (transient)
+deactivate builder
+
+builder -> builder: repository.save(order)
+
+note right of builder
+  **Build and Persist:**
+  ```java
+  public Order buildAndSave(
+    OrderRepository repo
+  ) {
+    Order order = build();
+    return repo.save(order);
+  }
+  ```
+  
+  **Conveniente para testes:**
+  - Cria E persiste
+  - Uma linha
+  - Menos boilerplate
+end note
+
+builder -> order: (persisted)
+activate order
+order --> builder: Order (with ID from DB)
+deactivate order
+
+builder --> test: Order (persisted)
+deactivate builder
+
+test -> test: assertThat(order.getId())\n  .isNotNull()
+test -> test: assertThat(order.getCreatedAt())\n  .isNotNull()
+
+deactivate test
+
+== Comparison: Without Builder ==
+
+note over test, order
+  **Without Builder (Constructor Hell):**
+  
+  ```java
+  @Test
+  void testOrder() {
+    // ❌ Difícil de ler
+    Customer customer = new Customer(
+      "CUST-123",
+      "John Doe",
+      "john@example.com",
+      "123 Main St",
+      "Springfield",
+      "12345",
+      true, // VIP?
+      10,   // Discount?
+      LocalDateTime.now()
+    );
+    
+    OrderItem item1 = new OrderItem(
+      "ITEM-1",
+      "PROD-1",
+      "Product 1",
+      1,
+      Money.of(50.00),
+      Money.of(50.00)
+    );
+    
+    OrderItem item2 = new OrderItem(
+      "ITEM-2",
+      "PROD-2",
+      "Product 2",
+      2,
+      Money.of(25.00),
+      Money.of(50.00)
+    );
+    
+    List<OrderItem> items = 
+      Arrays.asList(item1, item2);
+    
+    Order order = new Order(
+      "ORD-123",
+      customer,
+      items,
+      Money.of(100.00),
+      OrderStatus.PENDING,
+      LocalDateTime.now(),
+      null, // completedAt
+      null, // paymentId
+      null  // shippingId
+    );
+    
+    // 😱 40+ linhas para criar 1 order!
+  }
+  ```
+  
+  **With Builder (Clean):**
+  
+  ```java
+  @Test
+  void testOrder() {
+    // ✅ Legível e conciso
+    Order order = OrderBuilder.anOrder()
+      .withId("ORD-123")
+      .withCustomer(
+        CustomerBuilder.vipCustomer()
+          .withName("John Doe")
+      )
+      .withItems(2)
+      .build();
+    
+    // 😊 10 linhas, super legível!
+  }
+  ```
+  
+  **Builder wins! 🏆**
+end note
+
+== Advanced: Builder with Validation ==
+
+test -> builder: OrderBuilder.anOrder()\n  .withCustomer(null)\n  .build()
+activate test
+activate builder
+
+builder -> builder: validate()
+builder -> builder: customer == null?
+
+builder --> test: ❌ IllegalStateException(\n  "Customer is required")
+deactivate builder
+
+test -> test: assertThrows(\n  IllegalStateException.class,\n  () -> builder.build())
+
+deactivate test
+
+note right of builder
+  **Early Validation:**
+  - Evita objetos inválidos
+  - Fail fast
+  - Clear error messages
+  
+  ```java
+  public Order build() {
+    if (customer == null) {
+      throw new IllegalStateException(
+        "Customer is required"
+      );
+    }
+    
+    if (items.isEmpty()) {
+      throw new IllegalStateException(
+        "At least one item required"
+      );
+    }
+    
+    if (total == null) {
+      calculateTotal();
+    }
+    
+    if (id == null) {
+      id = OrderId.generate();
+    }
+    
+    return new Order(
+      id, customer, items,
+      total, status, createdAt
+    );
+  }
+  ```
+end note
+
+== Benefits & Use Cases ==
+
+note over test, order
+  **Benefits:**
+  
+  ✅ **Readability:**
+  - Fluent interface (English-like)
+  - Self-documenting code
+  - Named parameters (Java doesn't have)
+  
+  ✅ **Flexibility:**
+  - Optional parameters
+  - Sensible defaults
+  - Convenience methods
+  
+  ✅ **Immutability:**
+  - Build immutable objects
+  - Validate before creation
+  - Thread-safe results
+  
+  ✅ **Testability:**
+  - Easy to create test data
+  - Reduce boilerplate
+  - Object Mother pattern
+  
+  **Use Cases:**
+  
+  - **Test Data Builders:**
+    - OrderBuilder, CustomerBuilder
+    - Reduce test setup code
+    - Improve test readability
+  
+  - **Complex Object Construction:**
+    - HttpClient, RestTemplate config
+    - Query builders (SQL, MongoDB)
+    - Email/Notification builders
+  
+  - **Configuration:**
+    - ApplicationConfig builder
+    - Security config builder
+    - Connection pool builder
+  
+  - **DTOs/Requests:**
+    - API request builders
+    - GraphQL query builders
+    - Report builders
+  
+  **When to Use:**
+  - Many constructor parameters (>4)
+  - Optional parameters
+  - Immutable objects
+  - Test data creation
+  - Configuration objects
+  
+  **When NOT to Use:**
+  - Simple objects (1-3 fields)
+  - Mutable objects (use setters)
+  - No validation needed
+  - Performance critical paths
+  
+  **Real-World Examples:**
+  
+  - **Java:** StringBuilder, Stream.builder()
+  - **Spring:** RestTemplate, WebClient
+  - **Lombok:** @Builder annotation
+  - **Testing:** Mockito.mock(), WireMock
+  - **HTTP:** OkHttpClient.Builder
+end note
+
+@enduml

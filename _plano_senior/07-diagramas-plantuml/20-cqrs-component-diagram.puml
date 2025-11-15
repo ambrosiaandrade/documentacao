@@ -1,0 +1,290 @@
+@startuml CQRS - Component Diagram
+!theme plain
+
+title CQRS Pattern - Component Architecture View
+
+package "Client Layer" {
+  component [Web UI] as web
+  component [Mobile App] as mobile
+  component [Admin Panel] as admin
+}
+
+package "API Layer" {
+  component [Command API\n(Write Operations)] as command_api
+  component [Query API\n(Read Operations)] as query_api
+}
+
+package "Command Side (Write Model)" {
+  component [Command Handler] as cmd_handler
+  component [Domain Model\n(Aggregates)] as domain
+  component [Repository\n(Write)] as write_repo
+  database "Write Database\n(PostgreSQL)\nNormalized (3NF)" as write_db
+}
+
+package "Event Bus" {
+  queue [Kafka\nEvent Stream] as kafka
+}
+
+package "Query Side (Read Model)" {
+  component [Event Consumer] as event_consumer
+  component [Projector\n(View Builder)] as projector
+  component [Query Handler] as query_handler
+  database "Read Database 1\n(MongoDB)\nDenormalized" as read_db1
+  database "Read Database 2\n(Elasticsearch)\nFull-Text Search" as read_db2
+  database "Read Database 3\n(Redis)\nCache/Counters" as read_db3
+}
+
+package "Cross-Cutting" {
+  component [Authentication] as auth
+  component [Logging] as log
+  component [Metrics] as metrics
+}
+
+' Client connections
+web --> command_api : POST /commands/create-order
+web --> query_api : GET /queries/orders
+mobile --> command_api : Commands
+mobile --> query_api : Queries
+admin --> command_api : Admin commands
+admin --> query_api : Reports
+
+' Command flow
+command_api --> auth : Authenticate
+command_api --> cmd_handler : Validate & Execute
+cmd_handler --> domain : Invoke business logic
+domain --> write_repo : Persist changes
+write_repo --> write_db : INSERT/UPDATE
+cmd_handler --> kafka : Publish events
+command_api --> log : Log commands
+command_api --> metrics : Record metrics
+
+' Event flow
+kafka --> event_consumer : Subscribe
+event_consumer --> projector : Transform events
+
+' Query flow
+projector --> read_db1 : Update view (orders)
+projector --> read_db2 : Index for search
+projector --> read_db3 : Update counters
+
+query_api --> auth : Authenticate
+query_api --> query_handler : Execute query
+query_handler --> read_db1 : Find documents
+query_handler --> read_db2 : Full-text search
+query_handler --> read_db3 : Get cached data
+query_api --> log : Log queries
+query_api --> metrics : Record metrics
+
+note right of command_api
+  **Command API (Write):**
+  
+  - POST /commands/create-order
+  - POST /commands/confirm-order
+  - POST /commands/cancel-order
+  - PUT /commands/update-item
+  
+  **Characteristics:**
+  - Synchronous (immediate validation)
+  - Returns 202 Accepted
+  - Business logic enforcement
+  - Transactional
+  - Low throughput (writes are rare)
+end note
+
+note right of query_api
+  **Query API (Read):**
+  
+  - GET /queries/orders/{id}
+  - GET /queries/orders?customer={id}
+  - GET /queries/orders/search?q=...
+  - GET /queries/dashboard/stats
+  
+  **Characteristics:**
+  - Synchronous (immediate response)
+  - Returns 200 OK with data
+  - No business logic
+  - Read-only
+  - High throughput (reads are frequent)
+  - Eventually consistent
+end note
+
+note bottom of write_db
+  **Write Database (PostgreSQL):**
+  
+  **Schema: Normalized (3NF)**
+  ```sql
+  CREATE TABLE orders (
+    id UUID PRIMARY KEY,
+    customer_id UUID REFERENCES customers(id),
+    status VARCHAR(20),
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP
+  );
+  
+  CREATE TABLE order_items (
+    id UUID PRIMARY KEY,
+    order_id UUID REFERENCES orders(id),
+    product_id UUID REFERENCES products(id),
+    quantity INT,
+    price DECIMAL(10,2)
+  );
+  ```
+  
+  **Optimized for:**
+  - Writes (INSERT, UPDATE, DELETE)
+  - Data consistency
+  - Referential integrity
+  - Transactions
+end note
+
+note bottom of read_db1
+  **Read Database 1 (MongoDB):**
+  
+  **Schema: Denormalized**
+  ```json
+  {
+    "_id": "order123",
+    "customerId": "cust456",
+    "customer": {
+      "name": "John Doe",
+      "email": "john@example.com"
+    },
+    "items": [
+      {
+        "productId": "prod789",
+        "productName": "Widget",
+        "quantity": 2,
+        "price": 10.00
+      }
+    ],
+    "total": 20.00,
+    "status": "CONFIRMED",
+    "createdAt": "2025-11-15T10:30:00Z"
+  }
+  ```
+  
+  **Optimized for:**
+  - Fast reads (no JOINs)
+  - Single document queries
+  - Aggregations
+  - Flexible schema
+end note
+
+note bottom of read_db2
+  **Read Database 2 (Elasticsearch):**
+  
+  **Index: orders**
+  ```json
+  {
+    "orderId": "order123",
+    "customerName": "John Doe",
+    "items": ["Widget", "Gadget"],
+    "total": 20.00,
+    "status": "CONFIRMED",
+    "searchText": "order123 John Doe Widget"
+  }
+  ```
+  
+  **Optimized for:**
+  - Full-text search
+  - Fuzzy matching
+  - Faceted search
+  - Analytics
+end note
+
+note bottom of read_db3
+  **Read Database 3 (Redis):**
+  
+  **Cached Data:**
+  ```
+  order:order123 → {serialized JSON}
+  customer:orders:cust456 → [order123, order124]
+  stats:orders:today → 1523
+  stats:revenue:today → 45678.90
+  ```
+  
+  **Optimized for:**
+  - Hot data (frequent reads)
+  - Counters
+  - Real-time stats
+  - Sub-millisecond latency
+end note
+
+note right of kafka
+  **Event Bus (Kafka):**
+  
+  **Topics:**
+  - order.created
+  - order.confirmed
+  - order.cancelled
+  - order.shipped
+  
+  **Event Example:**
+  ```json
+  {
+    "eventId": "evt123",
+    "eventType": "OrderCreatedEvent",
+    "aggregateId": "order123",
+    "timestamp": "2025-11-15T10:30:00Z",
+    "data": {
+      "orderId": "order123",
+      "customerId": "cust456",
+      "items": [...],
+      "total": 20.00
+    }
+  }
+  ```
+  
+  **Benefits:**
+  - Decoupling (write ≠ read)
+  - Multiple projections
+  - Event replay
+  - Audit trail
+end note
+
+note bottom of projector
+  **Projector (View Builder):**
+  
+  ```python
+  class OrderProjector:
+    def on_order_created(self, event):
+      # Project to MongoDB (order view)
+      mongo.orders.insert_one({
+        '_id': event.orderId,
+        'customerId': event.customerId,
+        'items': event.items,
+        'total': event.total,
+        'status': 'PENDING'
+      })
+      
+      # Index in Elasticsearch (search)
+      es.index(index='orders', body={
+        'orderId': event.orderId,
+        'customerName': event.customerName,
+        'searchText': f"{event.orderId} {event.customerName}"
+      })
+      
+      # Update Redis counters
+      redis.incr('stats:orders:today')
+      redis.incrbyfloat('stats:revenue:today', event.total)
+    
+    def on_order_confirmed(self, event):
+      # Update MongoDB
+      mongo.orders.update_one(
+        {'_id': event.orderId},
+        {'$set': {'status': 'CONFIRMED'}}
+      )
+      
+      # Update Elasticsearch
+      es.update(index='orders', id=event.orderId, body={
+        'doc': {'status': 'CONFIRMED'}
+      })
+  ```
+  
+  **Multiple Projections:**
+  - Each read model optimized for its use case
+  - Same events, different views
+  - Can add new projections without changing write side
+end note
+
+@enduml

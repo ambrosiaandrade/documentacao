@@ -1,0 +1,732 @@
+@startuml JWE - JSON Web Encryption
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title JWE (JSON Web Encryption) - End-to-End Encryption
+
+participant "Sender\n(Client)" as sender
+participant "JWE Library\n(nimbus-jose-jwt)" as jwe_sender_lib
+database "Recipient's\nPublic Key" as public_key_store
+queue "Insecure Channel\n(Internet)" as channel
+participant "Potential\nAttacker" as attacker
+participant "JWE Library\n(Recipient)" as jwe_receiver_lib
+database "Recipient's\nPrivate Key" as private_key_store
+participant "Recipient\n(Server)" as recipient
+
+== JWE Structure Overview ==
+
+note over sender, recipient
+  **JWE Compact Serialization: 5 parts separated by dots**
+  
+  ```
+  BASE64URL(UTF8(JWE Protected Header)) .
+  BASE64URL(JWE Encrypted Key) .
+  BASE64URL(JWE Initialization Vector) .
+  BASE64URL(JWE Ciphertext) .
+  BASE64URL(JWE Authentication Tag)
+  ```
+  
+  **Example:**
+  ```
+  eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIn0.
+  OKOawDo13gRp2ojaHV7LFpZcgV7T6DVZKTyKOMTYUmKoTCVJRgckCL9kiMT03JGe.
+  48V1_ALb6US04U3b.
+  5eym8TW_c8SuK0ltJ3rpYIzOeDQz7TALvtu6UG9oMo4vpzs9tX_EFShS8iB7j6jiSdiwkIr3ajwQzaBtQD_A.
+  XFBoMYUZodetZdvTiFvSkQ
+  ```
+  
+  **JWT vs JWE:**
+  - JWT: Signed (integrity), readable payload
+  - JWE: Encrypted (confidentiality), unreadable payload
+  - Can combine: Nested JWT (sign then encrypt)
+end note
+
+== 1. Key Pair Generation (One-time Setup) ==
+
+recipient -> jwe_receiver_lib: Generate RSA key pair
+activate recipient
+activate jwe_receiver_lib
+
+jwe_receiver_lib -> jwe_receiver_lib: Generate RSA keys:\nkey size = 4096 bits\npublic exponent = 65537
+
+note right of jwe_receiver_lib
+  **RSA Key Generation:**
+  
+  ```java
+  import com.nimbusds.jose.jwk.RSAKey;
+  import java.security.KeyPairGenerator;
+  
+  // Generate key pair
+  KeyPairGenerator generator = 
+    KeyPairGenerator.getInstance("RSA");
+  generator.initialize(4096);
+  KeyPair keyPair = generator.generateKeyPair();
+  
+  // Create JWK (JSON Web Key)
+  RSAKey jwk = new RSAKey.Builder(
+    (RSAPublicKey) keyPair.getPublic()
+  )
+    .privateKey(keyPair.getPrivate())
+    .keyID("recipient-key-2025-11-15")
+    .algorithm(JWEAlgorithm.RSA_OAEP_256)
+    .build();
+  ```
+  
+  **Key Algorithms:**
+  - RSA-OAEP-256 (Recommended)
+  - RSA-OAEP (Older)
+  - ECDH-ES+A256KW (Elliptic Curve)
+  - A256GCMKW (AES Key Wrap)
+end note
+
+jwe_receiver_lib --> recipient: KeyPair:\n- PublicKey (for encryption)\n- PrivateKey (for decryption)
+deactivate jwe_receiver_lib
+
+recipient -> private_key_store: Store private key securely\n(HSM/KMS)
+activate private_key_store
+
+note right of private_key_store
+  **Private Key Storage:**
+  
+  - Hardware Security Module (HSM)
+  - AWS KMS, Azure Key Vault, GCP KMS
+  - Encrypted file system
+  - Never in code or config files!
+  
+  **Access Control:**
+  - Minimal permissions
+  - Audit logs
+  - Key rotation policy
+end note
+
+private_key_store --> recipient: Stored securely
+deactivate private_key_store
+
+recipient -> public_key_store: Publish public key\n(JWKS endpoint)
+activate public_key_store
+
+note right of public_key_store
+  **JWKS Endpoint:**
+  
+  **URL:** https://api.example.com/.well-known/jwks.json
+  
+  **Response:**
+  ```json
+  {
+    "keys": [
+      {
+        "kty": "RSA",
+        "use": "enc",
+        "kid": "recipient-key-2025-11-15",
+        "alg": "RSA-OAEP-256",
+        "n": "0vx7agoebGcQSuuPiLJXZpt...modulus",
+        "e": "AQAB"
+      }
+    ]
+  }
+  ```
+  
+  **Key Fields:**
+  - kty: Key type (RSA, EC, oct)
+  - use: "enc" for encryption, "sig" for signing
+  - kid: Key ID (for key rotation)
+  - alg: Algorithm (RSA-OAEP-256)
+  - n: RSA modulus (public)
+  - e: RSA public exponent
+end note
+
+public_key_store --> recipient: Published
+deactivate public_key_store
+deactivate recipient
+
+== 2. JWE Encryption (Sender Side) ==
+
+actor User as user
+
+user -> sender: Send sensitive data:\n{\n  "ssn": "123-45-6789",\n  "credit_card": "4111111111111111",\n  "cvv": "123"\n}
+activate user
+activate sender
+
+note right of sender
+  **Sensitive Data to Encrypt:**
+  
+  - Personal Identifiable Information (PII)
+  - Financial data (credit cards, bank accounts)
+  - Health records (PHI)
+  - API keys, secrets
+  - Any confidential information
+  
+  **Why JWE instead of JWT:**
+  - JWT is only signed (readable by anyone)
+  - JWE is encrypted (readable only by recipient)
+  - Base64 is encoding, NOT encryption!
+end note
+
+sender -> public_key_store: GET /.well-known/jwks.json\n(fetch recipient's public key)
+activate public_key_store
+
+public_key_store --> sender: {\n  "keys": [{\n    "kid": "recipient-key-2025-11-15",\n    "kty": "RSA",\n    "use": "enc",\n    "n": "modulus...",\n    "e": "AQAB"\n  }]\n}
+deactivate public_key_store
+
+sender -> jwe_sender_lib: encryptData(\n  payload: {\n    "ssn": "123-45-6789",\n    "credit_card": "4111111111111111",\n    "cvv": "123",\n    "iat": 1700000000,\n    "exp": 1700003600\n  },\n  recipientPublicKey: RSAKey\n)
+activate jwe_sender_lib
+
+note right of jwe_sender_lib
+  **JWE Encryption Process:**
+  
+  1. Generate Content Encryption Key (CEK)
+  2. Encrypt payload with CEK (AES-GCM)
+  3. Encrypt CEK with recipient's public key (RSA-OAEP)
+  4. Create authentication tag (GCM)
+  5. Assemble JWE Compact Serialization
+  
+  **Two-layer encryption:**
+  - Symmetric: Fast encryption of large payload (AES)
+  - Asymmetric: Secure key exchange (RSA)
+  - Hybrid cryptosystem
+end note
+
+jwe_sender_lib -> jwe_sender_lib: 1. Create JWE Header:\n{\n  "alg": "RSA-OAEP-256",\n  "enc": "A256GCM",\n  "kid": "recipient-key-2025-11-15",\n  "cty": "JWT"\n}
+
+note right of jwe_sender_lib
+  **JWE Header Fields:**
+  
+  - alg: Key encryption algorithm
+    * RSA-OAEP-256 (Recommended)
+    * RSA-OAEP
+    * ECDH-ES+A256KW
+  
+  - enc: Content encryption algorithm
+    * A256GCM (AES-256-GCM, Recommended)
+    * A128GCM (AES-128-GCM)
+    * A256CBC-HS512
+  
+  - kid: Key ID (which public key to use)
+  
+  - cty: Content type
+    * "JWT" if encrypting a JWT
+    * Omit for plain JSON
+end note
+
+jwe_sender_lib -> jwe_sender_lib: 2. Generate CEK:\nContent Encryption Key\n= random 256 bits\n(for AES-256-GCM)
+
+jwe_sender_lib -> jwe_sender_lib: 3. Generate IV:\nInitialization Vector\n= random 96 bits\n(for GCM mode)
+
+note right of jwe_sender_lib
+  **CEK (Content Encryption Key):**
+  
+  ```java
+  // Generate random AES key
+  KeyGenerator keyGen = 
+    KeyGenerator.getInstance("AES");
+  keyGen.init(256); // AES-256
+  SecretKey cek = keyGen.generateKey();
+  ```
+  
+  **IV (Initialization Vector):**
+  
+  ```java
+  // Generate random IV
+  SecureRandom random = new SecureRandom();
+  byte[] iv = new byte[12]; // 96 bits for GCM
+  random.nextBytes(iv);
+  ```
+  
+  **Must be unique for each encryption!**
+end note
+
+jwe_sender_lib -> jwe_sender_lib: 4. Encrypt Payload:\nAAD = BASE64URL(JWE Header)\nPlaintext = JSON payload\n\nCiphertext, AuthTag = \n  AES-256-GCM.encrypt(\n    key: CEK,\n    iv: IV,\n    plaintext: Plaintext,\n    aad: AAD\n  )
+
+note right of jwe_sender_lib
+  **AES-GCM Encryption:**
+  
+  ```java
+  import javax.crypto.Cipher;
+  import javax.crypto.spec.GCMParameterSpec;
+  
+  // Prepare cipher
+  Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+  GCMParameterSpec gcmSpec = 
+    new GCMParameterSpec(128, iv); // 128-bit auth tag
+  cipher.init(Cipher.ENCRYPT_MODE, cek, gcmSpec);
+  
+  // Add Additional Authenticated Data (AAD)
+  byte[] aad = base64UrlEncode(header).getBytes();
+  cipher.updateAAD(aad);
+  
+  // Encrypt
+  byte[] plaintextBytes = payload.getBytes(UTF_8);
+  byte[] ciphertextAndTag = cipher.doFinal(plaintextBytes);
+  
+  // Split ciphertext and authentication tag
+  int ciphertextLen = ciphertextAndTag.length - 16;
+  byte[] ciphertext = Arrays.copyOf(ciphertextAndTag, ciphertextLen);
+  byte[] authTag = Arrays.copyOfRange(
+    ciphertextAndTag, ciphertextLen, ciphertextAndTag.length
+  );
+  ```
+  
+  **GCM (Galois/Counter Mode):**
+  - Authenticated encryption (AEAD)
+  - Provides confidentiality + integrity
+  - Authentication tag proves data not tampered
+end note
+
+jwe_sender_lib -> jwe_sender_lib: 5. Encrypt CEK:\nEncrypted Key = \n  RSA-OAEP-256.encrypt(\n    publicKey: recipientPublicKey,\n    plaintext: CEK\n  )
+
+note right of jwe_sender_lib
+  **RSA-OAEP Key Encryption:**
+  
+  ```java
+  import javax.crypto.Cipher;
+  import java.security.spec.OAEPParameterSpec;
+  import java.security.spec.MGF1ParameterSpec;
+  
+  // Prepare RSA cipher with OAEP padding
+  Cipher rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding");
+  
+  OAEPParameterSpec oaepParams = new OAEPParameterSpec(
+    "SHA-256",
+    "MGF1",
+    MGF1ParameterSpec.SHA256,
+    PSource.PSpecified.DEFAULT
+  );
+  
+  rsaCipher.init(
+    Cipher.ENCRYPT_MODE,
+    recipientPublicKey,
+    oaepParams
+  );
+  
+  // Encrypt CEK with recipient's public key
+  byte[] encryptedKey = rsaCipher.doFinal(cek.getEncoded());
+  ```
+  
+  **Why encrypt CEK?**
+  - Only recipient can decrypt (has private key)
+  - CEK is symmetric (fast for large data)
+  - RSA is asymmetric (secure key exchange)
+  - Hybrid: Best of both worlds!
+end note
+
+jwe_sender_lib -> jwe_sender_lib: 6. Assemble JWE:\nPart 1: BASE64URL(JWE Header)\nPart 2: BASE64URL(Encrypted Key)\nPart 3: BASE64URL(IV)\nPart 4: BASE64URL(Ciphertext)\nPart 5: BASE64URL(Auth Tag)\n\nJWE = Part1.Part2.Part3.Part4.Part5
+
+jwe_sender_lib --> sender: JWE Token:\neyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoicmVjaXBpZW50LWtleS0yMDI1LTExLTE1In0.OKOawDo13gRp2ojaHV7LFpZcgV7T6DVZKTyKOMTYUmKoTCVJRgckCL9kiMT03JGe.48V1_ALb6US04U3b.5eym8TW_c8SuK0ltJ3rpYIzOeDQz7TALvtu6UG9oMo4vpzs9tX_EFShS8iB7j6jiSdiwkIr3ajwQzaBtQD_A.XFBoMYUZodetZdvTiFvSkQ
+deactivate jwe_sender_lib
+
+note right of sender
+  **JWE Token Breakdown:**
+  
+  **Part 1 - Protected Header (readable):**
+  ```json
+  {
+    "alg": "RSA-OAEP-256",
+    "enc": "A256GCM",
+    "kid": "recipient-key-2025-11-15"
+  }
+  ```
+  
+  **Part 2 - Encrypted Key (unreadable):**
+  CEK encrypted with RSA public key
+  Only recipient can decrypt with private key
+  
+  **Part 3 - Initialization Vector (readable):**
+  Random IV used for AES-GCM
+  Must be unique per encryption
+  
+  **Part 4 - Ciphertext (unreadable):**
+  Encrypted payload
+  Only decryptable with CEK
+  
+  **Part 5 - Authentication Tag (unreadable):**
+  Proves integrity
+  Detects tampering
+end note
+
+sender -> channel: POST /api/payment\nContent-Type: application/jose\n\neyJhbGciOiJSU0EtT0FFUC0yNTYi...XFBoMYUZodetZdvTiFvSkQ
+deactivate sender
+activate channel
+
+note right of channel
+  **Transmission Over Insecure Channel:**
+  
+  - Token transmitted over HTTP (or even HTTPS)
+  - Payload is encrypted (unreadable)
+  - Even if intercepted, cannot be decrypted
+  - Only recipient with private key can decrypt
+  
+  **Content-Type:**
+  - application/jose
+  - application/jose+json
+  - Custom header: X-JWE-Token
+end note
+
+== 3. Man-in-the-Middle Attack (Fails) ==
+
+channel -> attacker: Intercept JWE token\n(network sniffing)
+activate attacker
+
+note right of attacker
+  **Attacker Actions:**
+  
+  1. Capture JWE token
+  2. Attempt to decode (Base64URL)
+  3. Try to read payload
+  4. Try to decrypt
+end note
+
+attacker -> attacker: Decode Part 1 (Header):\n{\n  "alg": "RSA-OAEP-256",\n  "enc": "A256GCM",\n  "kid": "recipient-key-2025-11-15"\n}
+
+attacker -> attacker: Attempt to decode Part 4:\nCiphertext\n= garbage bytes ❌
+
+note right of attacker
+  **What Attacker Sees:**
+  
+  **Header (readable):**
+  - Algorithm used
+  - Key ID
+  - Metadata
+  
+  **Encrypted Key (unreadable):**
+  - CEK encrypted with RSA
+  - Need recipient's private key to decrypt
+  - Infeasible to break RSA-4096
+  
+  **Ciphertext (unreadable):**
+  - Payload encrypted with AES-256-GCM
+  - Need CEK to decrypt
+  - Don't have CEK
+  
+  **Attacker CANNOT:**
+  - Read payload (no CEK)
+  - Decrypt CEK (no private key)
+  - Modify payload (auth tag will fail)
+  - Forge token (cannot create valid auth tag)
+end note
+
+attacker -> attacker: Try to decrypt CEK:\nRSA-OAEP.decrypt(\n  ciphertext: Encrypted Key,\n  privateKey: ???\n)\n\nNo private key! ❌
+
+attacker -> attacker: Try brute force RSA:\n2^4096 combinations\n= infeasible ❌
+
+attacker -> attacker: Attack FAILED ✅\nPayload remains confidential
+
+channel -> recipient: Forward JWE token\n(unchanged)
+deactivate attacker
+deactivate channel
+activate recipient
+
+== 4. JWE Decryption (Recipient Side) ==
+
+recipient -> jwe_receiver_lib: decryptJWE(jweToken)
+activate jwe_receiver_lib
+
+jwe_receiver_lib -> jwe_receiver_lib: 1. Split JWE token:\nparts = jweToken.split("\\.")\nheader = parts[0]\nencryptedKey = parts[1]\niv = parts[2]\nciphertext = parts[3]\nauthTag = parts[4]
+
+jwe_receiver_lib -> jwe_receiver_lib: 2. Decode Header:\nheaderJson = base64UrlDecode(header)\n{\n  "alg": "RSA-OAEP-256",\n  "enc": "A256GCM",\n  "kid": "recipient-key-2025-11-15"\n}
+
+jwe_receiver_lib -> jwe_receiver_lib: 3. Extract Key ID:\nkid = "recipient-key-2025-11-15"
+
+jwe_receiver_lib -> private_key_store: GET private key\n(kid: recipient-key-2025-11-15)
+activate private_key_store
+
+private_key_store --> jwe_receiver_lib: PrivateKey\n(RSA 4096-bit)
+deactivate private_key_store
+
+jwe_receiver_lib -> jwe_receiver_lib: 4. Decrypt Encrypted Key:\nCEK = RSA-OAEP-256.decrypt(\n  privateKey: recipientPrivateKey,\n  ciphertext: base64UrlDecode(encryptedKey)\n)
+
+note right of jwe_receiver_lib
+  **Decrypt CEK (Content Encryption Key):**
+  
+  ```java
+  // Decode encrypted key
+  byte[] encryptedKeyBytes = 
+    base64UrlDecode(encryptedKey);
+  
+  // Prepare RSA cipher with OAEP
+  Cipher rsaCipher = Cipher.getInstance(
+    "RSA/ECB/OAEPWithSHA-256AndMGF1Padding"
+  );
+  
+  OAEPParameterSpec oaepParams = new OAEPParameterSpec(
+    "SHA-256", "MGF1", 
+    MGF1ParameterSpec.SHA256,
+    PSource.PSpecified.DEFAULT
+  );
+  
+  rsaCipher.init(
+    Cipher.DECRYPT_MODE,
+    recipientPrivateKey,
+    oaepParams
+  );
+  
+  // Decrypt CEK
+  byte[] cekBytes = rsaCipher.doFinal(encryptedKeyBytes);
+  SecretKey cek = new SecretKeySpec(cekBytes, "AES");
+  ```
+end note
+
+jwe_receiver_lib -> jwe_receiver_lib: CEK decrypted ✅\nNow have symmetric key\nfor payload decryption
+
+jwe_receiver_lib -> jwe_receiver_lib: 5. Decrypt Payload:\nAAD = BASE64URL(JWE Header)\nIV = base64UrlDecode(iv)\nCiphertext = base64UrlDecode(ciphertext)\nAuthTag = base64UrlDecode(authTag)\n\nPlaintext = AES-256-GCM.decrypt(\n  key: CEK,\n  iv: IV,\n  ciphertext: Ciphertext,\n  authTag: AuthTag,\n  aad: AAD\n)
+
+note right of jwe_receiver_lib
+  **AES-GCM Decryption:**
+  
+  ```java
+  // Decode components
+  byte[] ivBytes = base64UrlDecode(iv);
+  byte[] ciphertextBytes = base64UrlDecode(ciphertext);
+  byte[] authTagBytes = base64UrlDecode(authTag);
+  
+  // Combine ciphertext + auth tag
+  byte[] ciphertextAndTag = new byte[
+    ciphertextBytes.length + authTagBytes.length
+  ];
+  System.arraycopy(ciphertextBytes, 0, ciphertextAndTag, 0, ciphertextBytes.length);
+  System.arraycopy(authTagBytes, 0, ciphertextAndTag, ciphertextBytes.length, authTagBytes.length);
+  
+  // Prepare cipher
+  Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+  GCMParameterSpec gcmSpec = 
+    new GCMParameterSpec(128, ivBytes);
+  cipher.init(Cipher.DECRYPT_MODE, cek, gcmSpec);
+  
+  // Add AAD
+  byte[] aad = base64UrlEncode(header).getBytes();
+  cipher.updateAAD(aad);
+  
+  // Decrypt and verify auth tag
+  byte[] plaintextBytes = cipher.doFinal(ciphertextAndTag);
+  String plaintext = new String(plaintextBytes, UTF_8);
+  ```
+  
+  **Auth Tag Verification:**
+  - GCM automatically verifies auth tag
+  - If tampered, throws AEADBadTagException
+  - Proves integrity + authenticity
+end note
+
+jwe_receiver_lib -> jwe_receiver_lib: 6. Parse Decrypted Payload:\nJSON.parse(plaintext)\n= {\n  "ssn": "123-45-6789",\n  "credit_card": "4111111111111111",\n  "cvv": "123",\n  "iat": 1700000000,\n  "exp": 1700003600\n}
+
+jwe_receiver_lib -> jwe_receiver_lib: 7. Validate Claims:\n✓ exp > now? (not expired)\n✓ iat <= now? (issued in past)
+
+jwe_receiver_lib --> recipient: Decrypted Payload:\n{\n  "ssn": "123-45-6789",\n  "credit_card": "4111111111111111",\n  "cvv": "123"\n}
+deactivate jwe_receiver_lib
+
+recipient -> recipient: Process payment\nwith decrypted data
+
+recipient --> channel: HTTP 200 OK\n{\n  "status": "success",\n  "transaction_id": "TXN-789"\n}
+deactivate recipient
+activate channel
+
+channel --> sender: HTTP 200 OK
+deactivate channel
+activate sender
+
+sender --> user: Payment successful!
+deactivate sender
+activate user
+deactivate user
+
+== 5. Nested JWT (Sign then Encrypt) ==
+
+note over sender, recipient
+  **Nested JWT: Combine JWT + JWE**
+  
+  **Use Case:**
+  - Need both integrity (signing) and confidentiality (encryption)
+  - JWT proves who issued token
+  - JWE hides token content
+  
+  **Process:**
+  
+  1. **Create JWT (signed):**
+  ```
+  eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.
+  eyJzdWIiOiJ1c2VyMTIzIiwic3NuIjoiMTIzLTQ1LTY3ODkifQ.
+  signature
+  ```
+  
+  2. **Encrypt JWT as JWE payload:**
+  ```java
+  JWEObject jweObject = new JWEObject(
+    new JWEHeader.Builder(
+      JWEAlgorithm.RSA_OAEP_256,
+      EncryptionMethod.A256GCM
+    ).contentType("JWT").build(),
+    new Payload(signedJWT.serialize()) // JWT as payload
+  );
+  
+  jweObject.encrypt(new RSAEncrypter(recipientPublicKey));
+  String nestedToken = jweObject.serialize();
+  ```
+  
+  3. **Result (5-part JWE containing JWT):**
+  ```
+  eyJhbGciOiJSU0EtT0FFUC0yNTYiLCJlbmMiOiJBMjU2R0NNIiwiY3R5IjoiSldUIn0.
+  encryptedKey.iv.encryptedJWT.authTag
+  ```
+  
+  **Decryption + Verification:**
+  
+  ```java
+  // 1. Decrypt JWE
+  JWEObject jweObject = JWEObject.parse(nestedToken);
+  jweObject.decrypt(new RSADecrypter(recipientPrivateKey));
+  
+  // 2. Extract JWT
+  SignedJWT signedJWT = 
+    SignedJWT.parse(jweObject.getPayload().toString());
+  
+  // 3. Verify JWT signature
+  JWSVerifier verifier = 
+    new RSASSAVerifier(issuerPublicKey);
+  
+  if (!signedJWT.verify(verifier)) {
+    throw new JWTVerificationException("Invalid signature");
+  }
+  
+  // 4. Extract claims
+  JWTClaimsSet claims = signedJWT.getJWTClaimsSet();
+  ```
+  
+  **Benefits:**
+  - Integrity: Signature proves authenticity
+  - Confidentiality: Encryption hides content
+  - Non-repudiation: Issuer cannot deny creating token
+  
+  **Drawbacks:**
+  - Larger token size (2 layers)
+  - More processing (sign + encrypt, decrypt + verify)
+  - Complexity
+  
+  **When to use:**
+  - Highly sensitive data (medical, financial)
+  - Regulatory requirements (HIPAA, PCI-DSS)
+  - Multi-party scenarios (prove origin + hide content)
+end note
+
+== JWE vs TLS vs JWE+TLS ==
+
+note over sender, recipient
+  **TLS (Transport Layer Security):**
+  
+  ✅ **Benefits:**
+  - Encrypts entire HTTP connection
+  - Standard, widely supported
+  - Protects data in transit
+  
+  ⚠️ **Limitations:**
+  - Only protects in transit (endpoint to endpoint)
+  - Decrypted at intermediaries (load balancers, proxies)
+  - Visible in server logs, error messages
+  - No end-to-end encryption
+  
+  **JWE (JSON Web Encryption):**
+  
+  ✅ **Benefits:**
+  - End-to-end encryption
+  - Only recipient can decrypt
+  - Protected even in logs, databases
+  - Intermediaries cannot read
+  
+  ⚠️ **Limitations:**
+  - Application-level (more complex)
+  - Key management overhead
+  - Larger payload (encryption overhead)
+  
+  **JWE + TLS (Defense in Depth):**
+  
+  ✅ **Best Practice:**
+  - TLS: Protects in transit
+  - JWE: Protects at rest and in intermediaries
+  - Layered security
+  
+  **Use Cases:**
+  
+  **TLS Only:**
+  - Non-sensitive data
+  - Trusted infrastructure
+  - Simple requirements
+  
+  **JWE Only:**
+  - Offline scenarios
+  - Store and forward
+  - Untrusted intermediaries
+  
+  **TLS + JWE:**
+  - Financial transactions
+  - Healthcare data (HIPAA)
+  - PCI-DSS compliance
+  - Zero-trust architecture
+end note
+
+== Security Best Practices ==
+
+note over sender, recipient
+  **JWE Security Checklist:**
+  
+  ✅ **Algorithms:**
+  - Key Encryption: RSA-OAEP-256 (not RSA-OAEP)
+  - Content Encryption: A256GCM (not A128GCM)
+  - Avoid deprecated algorithms
+  
+  ✅ **Key Management:**
+  - RSA: 4096-bit keys (minimum 2048-bit)
+  - Elliptic Curve: P-256 or P-384
+  - Store private keys in HSM/KMS
+  - Rotate keys regularly
+  
+  ✅ **Payload:**
+  - Include exp (expiration)
+  - Include iat (issued at)
+  - Keep payload small (encryption overhead)
+  - Validate claims after decryption
+  
+  ✅ **IV (Initialization Vector):**
+  - Generate random IV for EACH encryption
+  - Never reuse IV with same key
+  - IV uniqueness critical for GCM security
+  
+  ✅ **Authentication:**
+  - Use AEAD algorithms (GCM, CCM)
+  - Verify authentication tag
+  - Protect against tampering
+  
+  ⚠️ **Common Mistakes:**
+  
+  **Hardcoded Keys:**
+  - Never hardcode private keys
+  - Use environment variables or key stores
+  
+  **IV Reuse:**
+  - Catastrophic for GCM mode
+  - Breaks confidentiality
+  - Always generate new random IV
+  
+  **No Expiration:**
+  - JWE without exp claim
+  - Token valid indefinitely
+  - Always include expiration
+  
+  **Weak Algorithms:**
+  - RSA-OAEP (SHA-1) instead of RSA-OAEP-256 (SHA-256)
+  - A128GCM instead of A256GCM
+  - Use strongest algorithms
+  
+  **No Key Rotation:**
+  - Same keys used for years
+  - Compromise impacts all tokens
+  - Rotate keys every 90 days
+  
+  **Performance Considerations:**
+  
+  - RSA encryption slow (asymmetric)
+  - AES encryption fast (symmetric)
+  - Hybrid approach best
+  - Consider payload size (encryption overhead ~10-20%)
+  - Cache decrypted keys when possible
+end note
+
+@enduml

@@ -1,0 +1,473 @@
+@startuml Factory Method Pattern
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+title Factory Method Pattern - Payment Processing
+
+actor Cliente as client
+participant "PaymentController" as controller
+participant "PaymentService" as service
+participant "PaymentFactory\n(Abstract)" as factory
+participant "CreditCard\nFactory" as cc_factory
+participant "PayPal\nFactory" as paypal_factory
+participant "Pix\nFactory" as pix_factory
+participant "CreditCard\nProcessor" as cc_processor
+participant "PayPal\nProcessor" as paypal_processor
+participant "Pix\nProcessor" as pix_processor
+
+== Factory Pattern Setup ==
+
+note over factory
+  **Abstract Factory (Interface):**
+  ```java
+  public interface PaymentFactory {
+    PaymentProcessor createProcessor();
+    
+    PaymentValidator createValidator();
+    
+    boolean supports(PaymentMethod method);
+  }
+  ```
+  
+  **Factory Method:**
+  - Define interface para criação
+  - Subclasses decidem qual classe instanciar
+  - Desacopla criação do uso
+end note
+
+note over cc_factory, pix_factory
+  **Concrete Factories:**
+  
+  ```java
+  public class CreditCardFactory 
+    implements PaymentFactory {
+    
+    public PaymentProcessor 
+      createProcessor() {
+      return new CreditCardProcessor(
+        stripeClient,
+        fraudDetection,
+        config
+      );
+    }
+    
+    public PaymentValidator 
+      createValidator() {
+      return new CreditCardValidator();
+    }
+    
+    public boolean supports(
+      PaymentMethod method
+    ) {
+      return method == CREDIT_CARD;
+    }
+  }
+  ```
+end note
+
+== Request 1: Credit Card Payment ==
+
+client -> controller: POST /payments\n{\n  "method": "CREDIT_CARD",\n  "amount": 100.00,\n  "cardNumber": "****1234"\n}
+activate controller
+
+controller -> service: processPayment(\n  method: CREDIT_CARD,\n  amount: 100.00,\n  details: {...})
+activate service
+
+service -> service: selectFactory(CREDIT_CARD)
+
+note right of service
+  **Factory Selection:**
+  ```java
+  private PaymentFactory selectFactory(
+    PaymentMethod method
+  ) {
+    return factories.stream()
+      .filter(f -> f.supports(method))
+      .findFirst()
+      .orElseThrow(() -> 
+        new UnsupportedPaymentMethod());
+  }
+  ```
+end note
+
+service -> cc_factory: supports(CREDIT_CARD)
+activate cc_factory
+cc_factory --> service: true ✅
+deactivate cc_factory
+
+service -> cc_factory: createProcessor()
+activate cc_factory
+
+cc_factory -> cc_factory: inject dependencies:\n  - StripeClient\n  - FraudDetection\n  - Config
+
+cc_factory -> cc_processor: new CreditCardProcessor(...)
+activate cc_processor
+cc_processor --> cc_factory: processor instance
+deactivate cc_processor
+
+cc_factory --> service: PaymentProcessor
+deactivate cc_factory
+
+note right of cc_factory
+  **Factory Creates Complex Object:**
+  - Encapsula construção
+  - Injeta dependências
+  - Configura processor
+  - Cliente não precisa saber detalhes
+end note
+
+service -> cc_factory: createValidator()
+activate cc_factory
+cc_factory --> service: CreditCardValidator
+deactivate cc_factory
+
+service -> cc_processor: validate(paymentDetails)
+activate cc_processor
+cc_processor -> cc_processor: validateCardNumber()
+cc_processor -> cc_processor: validateExpiryDate()
+cc_processor -> cc_processor: validateCVV()
+cc_processor --> service: ValidationResult.valid()
+deactivate cc_processor
+
+service -> cc_processor: process(\n  amount: 100.00,\n  details: {...})
+activate cc_processor
+
+cc_processor -> cc_processor: encrypt card data
+cc_processor -> cc_processor: call Stripe API
+cc_processor -> cc_processor: detect fraud
+cc_processor -> cc_processor: store transaction
+
+cc_processor --> service: PaymentResult(\n  transactionId: "txn-cc-123",\n  status: SUCCESS,\n  method: CREDIT_CARD)
+deactivate cc_processor
+
+service --> controller: PaymentResult
+deactivate service
+
+controller --> client: 200 OK\n{\n  "transactionId": "txn-cc-123",\n  "status": "SUCCESS"\n}
+deactivate controller
+
+note right of client
+  **Cliente não sabe:**
+  - Como processor foi criado
+  - Dependências do processor
+  - Stripe API usado internamente
+  
+  **Benefício:** Desacoplamento
+end note
+
+== Request 2: PayPal Payment ==
+
+client -> controller: POST /payments\n{\n  "method": "PAYPAL",\n  "amount": 200.00,\n  "email": "user@example.com"\n}
+activate controller
+
+controller -> service: processPayment(\n  method: PAYPAL,\n  amount: 200.00,\n  details: {...})
+activate service
+
+service -> service: selectFactory(PAYPAL)
+
+service -> paypal_factory: supports(PAYPAL)
+activate paypal_factory
+paypal_factory --> service: true ✅
+deactivate paypal_factory
+
+service -> paypal_factory: createProcessor()
+activate paypal_factory
+
+paypal_factory -> paypal_factory: inject dependencies:\n  - PayPalClient\n  - TokenManager\n  - Config
+
+paypal_factory -> paypal_processor: new PayPalProcessor(...)
+activate paypal_processor
+paypal_processor --> paypal_factory: processor instance
+deactivate paypal_processor
+
+paypal_factory --> service: PaymentProcessor
+deactivate paypal_factory
+
+note right of paypal_processor
+  **Different Implementation:**
+  - PayPalProcessor usa PayPal API
+  - CreditCardProcessor usa Stripe API
+  - Mesma interface PaymentProcessor
+  - Service não precisa mudar código!
+end note
+
+service -> paypal_factory: createValidator()
+activate paypal_factory
+paypal_factory --> service: PayPalValidator
+deactivate paypal_factory
+
+service -> paypal_processor: validate(paymentDetails)
+activate paypal_processor
+paypal_processor -> paypal_processor: validateEmail()
+paypal_processor -> paypal_processor: validatePayPalAccount()
+paypal_processor --> service: ValidationResult.valid()
+deactivate paypal_processor
+
+service -> paypal_processor: process(\n  amount: 200.00,\n  details: {...})
+activate paypal_processor
+
+paypal_processor -> paypal_processor: get OAuth token
+paypal_processor -> paypal_processor: call PayPal API
+paypal_processor -> paypal_processor: handle redirect flow
+paypal_processor -> paypal_processor: store transaction
+
+paypal_processor --> service: PaymentResult(\n  transactionId: "txn-pp-456",\n  status: PENDING_REDIRECT,\n  method: PAYPAL,\n  redirectUrl: "...")
+deactivate paypal_processor
+
+service --> controller: PaymentResult
+deactivate service
+
+controller --> client: 200 OK\n{\n  "transactionId": "txn-pp-456",\n  "status": "PENDING_REDIRECT",\n  "redirectUrl": "https://paypal.com/..."\n}
+deactivate controller
+
+== Request 3: Pix Payment (New Method) ==
+
+note over pix_factory, pix_processor
+  **Adding New Payment Method:**
+  
+  1. Create PixProcessor (implements PaymentProcessor)
+  2. Create PixFactory (implements PaymentFactory)
+  3. Register factory in service
+  4. NO changes to existing code!
+  
+  **Open/Closed Principle:**
+  - Open for extension (new factories)
+  - Closed for modification (service unchanged)
+end note
+
+client -> controller: POST /payments\n{\n  "method": "PIX",\n  "amount": 50.00,\n  "pixKey": "user@example.com"\n}
+activate controller
+
+controller -> service: processPayment(\n  method: PIX,\n  amount: 50.00,\n  details: {...})
+activate service
+
+service -> service: selectFactory(PIX)
+
+service -> pix_factory: supports(PIX)
+activate pix_factory
+pix_factory --> service: true ✅
+deactivate pix_factory
+
+service -> pix_factory: createProcessor()
+activate pix_factory
+
+pix_factory -> pix_factory: inject dependencies:\n  - BacenClient\n  - QRCodeGenerator\n  - Config
+
+pix_factory -> pix_processor: new PixProcessor(...)
+activate pix_processor
+pix_processor --> pix_factory: processor instance
+deactivate pix_processor
+
+pix_factory --> service: PaymentProcessor
+deactivate pix_factory
+
+service -> pix_factory: createValidator()
+activate pix_factory
+pix_factory --> service: PixValidator
+deactivate pix_factory
+
+service -> pix_processor: validate(paymentDetails)
+activate pix_processor
+pix_processor -> pix_processor: validatePixKey()
+pix_processor -> pix_processor: validateAmount()
+pix_processor --> service: ValidationResult.valid()
+deactivate pix_processor
+
+service -> pix_processor: process(\n  amount: 50.00,\n  details: {...})
+activate pix_processor
+
+pix_processor -> pix_processor: generate QR Code
+pix_processor -> pix_processor: register in Bacen
+pix_processor -> pix_processor: set expiration (15min)
+pix_processor -> pix_processor: store transaction
+
+pix_processor --> service: PaymentResult(\n  transactionId: "txn-pix-789",\n  status: WAITING_PAYMENT,\n  method: PIX,\n  qrCode: "...",\n  qrCodeUrl: "...")
+deactivate pix_processor
+
+service --> controller: PaymentResult
+deactivate service
+
+controller --> client: 200 OK\n{\n  "transactionId": "txn-pix-789",\n  "status": "WAITING_PAYMENT",\n  "qrCode": "data:image/png;base64,...",\n  "expiresAt": "2025-11-15T10:15:00Z"\n}
+deactivate controller
+
+note right of client
+  **New Payment Method Added:**
+  - Zero changes to Service
+  - Zero changes to Controller
+  - Zero changes to existing factories
+  
+  **Factory Method wins! 🎉**
+end note
+
+== Factory Registration (Dependency Injection) ==
+
+note over service, pix_factory
+  **Spring Configuration:**
+  
+  ```java
+  @Configuration
+  public class PaymentConfig {
+    
+    @Bean
+    public PaymentService paymentService(
+      List<PaymentFactory> factories
+    ) {
+      return new PaymentService(factories);
+    }
+    
+    @Bean
+    public PaymentFactory creditCardFactory(
+      StripeClient stripe,
+      FraudDetection fraud
+    ) {
+      return new CreditCardFactory(
+        stripe, fraud
+      );
+    }
+    
+    @Bean
+    public PaymentFactory payPalFactory(
+      PayPalClient paypal
+    ) {
+      return new PayPalFactory(paypal);
+    }
+    
+    @Bean
+    public PaymentFactory pixFactory(
+      BacenClient bacen
+    ) {
+      return new PixFactory(bacen);
+    }
+  }
+  ```
+  
+  **Service Constructor:**
+  ```java
+  public class PaymentService {
+    private final List<PaymentFactory> factories;
+    
+    public PaymentService(
+      List<PaymentFactory> factories
+    ) {
+      this.factories = factories;
+    }
+    
+    public PaymentResult processPayment(
+      PaymentRequest request
+    ) {
+      PaymentFactory factory = 
+        selectFactory(request.method);
+      
+      PaymentProcessor processor = 
+        factory.createProcessor();
+      
+      return processor.process(request);
+    }
+  }
+  ```
+  
+  **Auto-discovery via DI:**
+  - Spring injeta todas as factories
+  - Sem configuração manual
+  - Adicionar novo método = novo @Bean
+end note
+
+== Testing with Factory Method ==
+
+participant "PaymentServiceTest" as test
+participant "MockPaymentFactory" as mock_factory
+participant "MockProcessor" as mock_processor
+
+test -> service: new PaymentService(\n  [mockFactory])
+activate test
+activate service
+service --> test: service instance
+deactivate service
+
+test -> mock_factory: when(supports(CREDIT_CARD))\n  .thenReturn(true)
+activate mock_factory
+mock_factory --> test: configured
+deactivate mock_factory
+
+test -> mock_factory: when(createProcessor())\n  .thenReturn(mockProcessor)
+activate mock_factory
+mock_factory --> test: configured
+deactivate mock_factory
+
+test -> mock_processor: when(process(any()))\n  .thenReturn(successResult)
+activate mock_processor
+mock_processor --> test: configured
+deactivate mock_processor
+
+test -> service: processPayment(request)
+activate service
+service -> mock_factory: supports(CREDIT_CARD)
+mock_factory --> service: true
+service -> mock_factory: createProcessor()
+mock_factory --> service: mockProcessor
+service -> mock_processor: process(request)
+mock_processor --> service: successResult
+service --> test: PaymentResult
+deactivate service
+
+test -> test: assertThat(result.isSuccess())\n  .isTrue()
+
+test --> test: ✅ Test Passed
+deactivate test
+
+note right of test
+  **Testability:**
+  - Easy to mock factories
+  - Test service without real processors
+  - Fast tests (<10ms)
+  - Isolated unit tests
+end note
+
+== Benefits & Use Cases ==
+
+note over factory, pix_processor
+  **Benefits:**
+  
+  ✅ **Extensibility:**
+  - Add new types easily
+  - Open/Closed Principle
+  - No existing code changes
+  
+  ✅ **Encapsulation:**
+  - Hide complex construction
+  - Manage dependencies
+  - Centralize creation logic
+  
+  ✅ **Flexibility:**
+  - Runtime selection
+  - Configuration-driven
+  - Plugin architecture
+  
+  ✅ **Testability:**
+  - Easy to mock
+  - Swap implementations
+  - Dependency injection friendly
+  
+  **Use Cases:**
+  
+  - Payment gateways (multiple providers)
+  - Database connectors (MySQL, PostgreSQL, MongoDB)
+  - Notification channels (email, SMS, push)
+  - Export formats (PDF, Excel, CSV)
+  - Authentication methods (OAuth, SAML, JWT)
+  - Logging implementations (file, database, cloud)
+  
+  **When to Use:**
+  - Multiple implementations of interface
+  - Complex object creation
+  - Runtime type selection
+  - Plugin/extensible architecture
+  
+  **When NOT to Use:**
+  - Simple object creation (use constructor)
+  - Only one implementation
+  - No variation expected
+end note
+
+@enduml
